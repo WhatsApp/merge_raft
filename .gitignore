@@ -54,6 +54,7 @@ _build
 *.iml
 rebar3.crashdump
 *~
+/.claude/
 /.elixir_ls/
 /.erlang.mk/
 /apps/merge_raft/c_src/env.mk

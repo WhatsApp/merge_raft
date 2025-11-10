@@ -65,10 +65,11 @@ init_per_testcase(TestCase, Config) ->
                 Opts = #{
                     name => ?CT_PEER_NAME(TestCase),
                     connection => 0,
-                    args => ["-connect_all", "false", "-kernel", "+S", "4:4"]
+                    args => ["-connect_all", "false", "-kernel", "dist_auto_connect", "once", "+S", "4:4"]
                 },
                 {ok, Peer, Node} = ?CT_PEER(Opts),
                 ok = peer:call(Peer, code, add_pathsa, [code:get_path()]),
+                {ok, _} = peer:call(Peer, application, ensure_all_started, [merge_raft]),
                 Self ! {self(), Peer, Node},
                 timer:sleep(infinity)
             end
@@ -111,12 +112,19 @@ kv(Config) ->
         ],
     [P1, P2, P3, P4, P5] = maps:keys(Peers),
     #{P1 := N1, P2 := N2, P3 := N3, P4 := N4, P5 := _N5} = Peers,
+    % Allow time for initial cluster formation
+    timer:sleep(1000),
     {ok, ok} = peer:call(P1, merge_raft_kv, sync_put, [?FUNCTION_NAME, a, 1]),
     {ok, ok} = peer:call(P2, merge_raft_kv, sync_put, [?FUNCTION_NAME, b, 2]),
+    % Connect nodes in a chain
     true = peer:call(P2, net_kernel, connect_node, [N1]),
-    true = peer:call(P4, net_kernel, connect_node, [N3]),
+    timer:sleep(500),
     true = peer:call(P3, net_kernel, connect_node, [N2]),
+    timer:sleep(500),
+    true = peer:call(P4, net_kernel, connect_node, [N3]),
+    timer:sleep(500),
     true = peer:call(P5, net_kernel, connect_node, [N4]),
+    timer:sleep(2000),  % Allow time for cluster merge
     ?WAIT_UNTIL({ok, 1} = peer:call(P5, merge_raft_kv, async_get, [?FUNCTION_NAME, a])),
     ?WAIT_UNTIL({ok, 2} = peer:call(P5, merge_raft_kv, async_get, [?FUNCTION_NAME, b])),
     ?WAIT_UNTIL({ok, 1} = peer:call(P5, merge_raft_kv, sync_get, [?FUNCTION_NAME, a])),

@@ -31,8 +31,7 @@
     %% the BUCK file in the application's base folder
     {applications, [
         kernel,
-        stdlib,
-        redbug
+        stdlib
     ]},
     {env, []},
     {doc, "doc"},
