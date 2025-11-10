@@ -1,26 +1,56 @@
+%%%-----------------------------------------------------------------------------
+%%% %CopyrightBegin%
+%%%
+%%% SPDX-License-Identifier: Apache-2.0
+%%%
+%%% Copyright (c) Meta Platforms, Inc. and affiliates.
+%%% Copyright (c) WhatsApp LLC
+%%%
+%%% Licensed under the Apache License, Version 2.0 (the "License");
+%%% you may not use this file except in compliance with the License.
+%%% You may obtain a copy of the License at
+%%%
+%%%     http://www.apache.org/licenses/LICENSE-2.0
+%%%
+%%% Unless required by applicable law or agreed to in writing, software
+%%% distributed under the License is distributed on an "AS IS" BASIS,
+%%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%%% See the License for the specific language governing permissions and
+%%% limitations under the License.
+%%%
+%%% %CopyrightEnd%
+%%%-----------------------------------------------------------------------------
 %%% % @format
-
 -module(merge_raft_SUITE).
+-moduledoc """
+
+""".
+-moduledoc #{copyright => "Meta Platforms, Inc. and affiliates."}.
+-compile(warn_missing_spec_all).
+-oncall("whatsapp_clr").
 
 -include_lib("stdlib/include/assert.hrl").
 -include_lib("common_test/include/ct.hrl").
 
-%% Test server callbacks
+-behaviour(ct_suite).
+
+%% ct_suite callbacks
 -export([
-    suite/0,
     all/0,
     groups/0,
     init_per_suite/1,
-    end_per_suite/1,
-    init_per_testcase/2,
-    end_per_testcase/2
+    end_per_suite/1
+    % init_per_testcase/2,
+    % end_per_testcase/2
 ]).
 
-%% Test cases
+%% Test Cases
 -export([
     kv/1
 ]).
 
+%% Macros
+-define(WAIT_UNTIL(Condition), ?WAIT_UNTIL(Condition, 5000)).
 -define(WAIT_UNTIL(Condition, TimeLimitMs),
     (fun() ->
         ___EndTime = erlang:system_time(millisecond) + TimeLimitMs,
@@ -41,57 +71,17 @@
     end)()
 ).
 
--define(WAIT_UNTIL(Condition), ?WAIT_UNTIL(Condition, 5000)).
+%%%=============================================================================
+%%% ct_suite callbacks
+%%%=============================================================================
 
-suite() ->
+-spec all() -> merge_raft_test:all().
+all() ->
     [
-        {timetrap, {seconds, 100}},
-        {auto_meckanic, #{enable_autoclean => true}},
-        {appatic, #{enable_autoclean => true}}
+        {group, basic}
     ].
 
-init_per_suite(Config) ->
-    net_kernel:start([list_to_atom(?CT_PEER_NAME(?MODULE))]),
-    Config.
-
-end_per_suite(_Config) ->
-    ok.
-
-init_per_testcase(TestCase, Config) ->
-    Self = self(),
-    [
-        spawn_link(
-            fun() ->
-                Opts = #{
-                    name => ?CT_PEER_NAME(TestCase),
-                    connection => 0,
-                    args => ["-connect_all", "false", "-kernel", "dist_auto_connect", "once", "+S", "4:4"]
-                },
-                {ok, Peer, Node} = ?CT_PEER(Opts),
-                ok = peer:call(Peer, code, add_pathsa, [code:get_path()]),
-                {ok, _} = peer:call(Peer, application, ensure_all_started, [merge_raft]),
-                Self ! {self(), Peer, Node},
-                timer:sleep(infinity)
-            end
-        )
-     || _ <- lists:seq(1, 5)
-    ],
-    Pids = [
-        receive
-            {Pid, Peer, Node} -> {Pid, Peer, Node}
-        end
-     || _ <- lists:seq(1, 5)
-    ],
-    Peers = #{Peer => Node || {_Pid, Peer, Node} <- Pids},
-    [{peers, Peers} | Config].
-
-end_per_testcase(_TestCase, Config) ->
-    [peer:stop(Peer) || Peer := _ <- proplists:get_value(peers, Config)],
-    ok.
-
-all() ->
-    [{group, basic}].
-
+-spec groups() -> merge_raft_test:groups().
 groups() ->
     [
         {basic, [parallel], [
@@ -99,42 +89,48 @@ groups() ->
         ]}
     ].
 
+-spec init_per_suite(Config :: ct_suite:ct_config()) -> merge_raft_test:init_per_suite().
+init_per_suite(Config) ->
+    {ok, _} = application:ensure_all_started(merge_raft_test),
+    Config.
+
+-spec end_per_suite(Config :: ct_suite:ct_config()) -> merge_raft_test:end_per_suite().
+end_per_suite(_Config) ->
+    ok.
+
 %%--------------------------------------------------------------------
 %% TEST CASES
 
-kv(Config) ->
-    Peers = proplists:get_value(peers, Config),
-    Mons =
-        [
-            monitor(process, Pid)
-         || Peer := _ <- Peers,
-            {ok, Pid} <- [peer:call(Peer, merge_raft_kv, start, [?FUNCTION_NAME])]
-        ],
-    [P1, P2, P3, P4, P5] = maps:keys(Peers),
-    #{P1 := N1, P2 := N2, P3 := N3, P4 := N4, P5 := _N5} = Peers,
-    % Allow time for initial cluster formation
-    timer:sleep(1000),
-    {ok, ok} = peer:call(P1, merge_raft_kv, sync_put, [?FUNCTION_NAME, a, 1]),
-    {ok, ok} = peer:call(P2, merge_raft_kv, sync_put, [?FUNCTION_NAME, b, 2]),
+-spec kv(Config :: ct_suite:ct_config()) -> merge_raft_test:testcase().
+kv(_Config) ->
+    PeerSet = peer_set_open(?FUNCTION_NAME, 5),
+    _ = merge_raft_test_peer_set:cover_call(PeerSet, merge_raft_kv, start, [kv], #{ordered => true}),
+    {ok, ok} = merge_raft_test_peer_set:call(PeerSet, 1, merge_raft_kv, sync_put, [?FUNCTION_NAME, a, 1]),
+    {ok, ok} = merge_raft_test_peer_set:call(PeerSet, 1, merge_raft_kv, sync_put, [?FUNCTION_NAME, b, 2]),
     % Connect nodes in a chain
-    true = peer:call(P2, net_kernel, connect_node, [N1]),
-    timer:sleep(500),
-    true = peer:call(P3, net_kernel, connect_node, [N2]),
-    timer:sleep(500),
-    true = peer:call(P4, net_kernel, connect_node, [N3]),
-    timer:sleep(500),
-    true = peer:call(P5, net_kernel, connect_node, [N4]),
-    timer:sleep(2000),  % Allow time for cluster merge
-    ?WAIT_UNTIL({ok, 1} = peer:call(P5, merge_raft_kv, async_get, [?FUNCTION_NAME, a])),
-    ?WAIT_UNTIL({ok, 2} = peer:call(P5, merge_raft_kv, async_get, [?FUNCTION_NAME, b])),
-    ?WAIT_UNTIL({ok, 1} = peer:call(P5, merge_raft_kv, sync_get, [?FUNCTION_NAME, a])),
-    ?WAIT_UNTIL({ok, 2} = peer:call(P5, merge_raft_kv, sync_get, [?FUNCTION_NAME, b])),
-    [
-        receive
-            {'DOWN', Mon, process, Pid, Reason} ->
-                error({Pid, Reason})
-        after 0 ->
-            ok
-        end
-     || Mon <- Mons
-    ].
+    true = merge_raft_test_peer_set:connect(PeerSet, 2, 1),
+    true = merge_raft_test_peer_set:connect(PeerSet, 3, 2),
+    true = merge_raft_test_peer_set:connect(PeerSet, 4, 3),
+    true = merge_raft_test_peer_set:connect(PeerSet, 5, 4),
+    % Allow time for cluster merge
+    ?WAIT_UNTIL(#{5 := #{1 := _, 4 := _}} = merge_raft_test_peer_set:graph_set(PeerSet), 10_000),
+    ?WAIT_UNTIL({ok, 1} = merge_raft_test_peer_set:call(PeerSet, 5, merge_raft_kv, async_get, [?FUNCTION_NAME, a])),
+    ?WAIT_UNTIL({ok, 2} = merge_raft_test_peer_set:call(PeerSet, 5, merge_raft_kv, async_get, [?FUNCTION_NAME, b])),
+    ?WAIT_UNTIL({ok, 1} = merge_raft_test_peer_set:call(PeerSet, 5, merge_raft_kv, sync_get, [?FUNCTION_NAME, a])),
+    ?WAIT_UNTIL({ok, 2} = merge_raft_test_peer_set:call(PeerSet, 5, merge_raft_kv, sync_get, [?FUNCTION_NAME, b])),
+    ok.
+
+%%%-----------------------------------------------------------------------------
+%%% Internal functions
+%%%-----------------------------------------------------------------------------
+
+-spec peer_set_open(TestCase, Size) -> PeerSet when
+    TestCase :: atom(),
+    Size :: pos_integer(),
+    PeerSet :: pid().
+peer_set_open(TestCase, Size) when is_atom(TestCase) andalso (is_integer(Size) andalso Size >= 1) ->
+    Setup = fun({_PeerNode, PeerPid}) ->
+        {ok, _} = peer:call(PeerPid, application, ensure_all_started, [merge_raft]),
+        ignored
+    end,
+    merge_raft_test_peer_set:open(erlang:atom_to_binary(TestCase), Size, Setup).

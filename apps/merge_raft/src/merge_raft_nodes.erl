@@ -2,6 +2,8 @@
 
 -module(merge_raft_nodes).
 -compile(warn_missing_spec_all).
+-author("zeyu@meta.com").
+-oncall("whatsapp_clr").
 -moduledoc """
 a simple gen_server implementing connect_all feature using merge raft
 """.
@@ -150,7 +152,8 @@ handle_info({connect, Node, N}, State) ->
             {noreply, State};
         _ ->
             % Send a message to async connect to the node
-            {undefined, Node} ! connect,
+            true = net_kernel:connect_node(Node),
+            % {undefined, Node} ! connect,
             {noreply, State#{Node => erlang:send_after((1 bsl N) * 1000, self(), {connect, Node, min(N + 1, 10)})}}
     end;
 handle_info(Nodes, State) ->

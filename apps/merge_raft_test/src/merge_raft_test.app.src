@@ -25,6 +25,7 @@
 {application, merge_raft_test, [
     {description, "merge_raft_test: test modules for merge_raft"},
     {vsn, "1.0.0"},
+    {mod, {merge_raft_test_app, []}},
     {modules, []},
     {registered, []},
     %% NOTE: Remember to sync changes to `applications` to

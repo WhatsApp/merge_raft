@@ -1,0 +1,4 @@
+[{<<"proper">>,
+  {git,"https://github.com/proper-testing/proper.git",
+       {ref,"db4ac35639e0ce8504ff3f07517dae49412a8674"}},
+  0}].

@@ -2,6 +2,8 @@
 
 -module(merge_raft_trans).
 -compile(warn_missing_spec_all).
+-author("zeyu@meta.com").
+-oncall("whatsapp_clr").
 -moduledoc """
 a simple transaction implementation with merge raft
 """.
