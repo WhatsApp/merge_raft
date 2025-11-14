@@ -1,0 +1,66 @@
+# The directory Mix will write compiled artifacts to.
+/_build/
+/apps/merge_raft/_build/
+/apps/merge_raft_test/_build/
+
+# If you run "mix test --cover", coverage assets end up here.
+/cover/
+
+# The directory Mix downloads your dependencies sources to.
+/deps/
+/apps/merge_raft/deps/
+/apps/merge_raft_test/deps/
+
+# Where third-party dependencies like ExDoc output generated docs.
+/doc/
+/apps/merge_raft/doc/
+/apps/merge_raft_test/doc/
+
+# Ignore .fetch files in case you like to edit your project deps locally.
+/.fetch
+
+# If the VM crashes, it generates a dump, let's ignore it too.
+erl_crash.dump
+
+# Also ignore archive artifacts (built via "mix archive.build").
+*.ez
+
+# Ignore package tarball (built via "mix hex.build").
+merge_raft-*.tar
+merge_raft_test-*.tar
+
+# Temporary files, for example, from tests.
+/tmp/
+
+# rebar3 and erlang.mk related files.
+.rebar3
+_*
+.eunit
+*.o
+*.beam
+*.plt
+*.swp
+*.swo
+.DS_Store
+.erlang.cookie
+ebin
+log
+erl_crash.dump
+.rebar
+logs
+_build
+.idea
+.vscode
+*.iml
+rebar3.crashdump
+*~
+/.claude/
+/.elixir_ls/
+/.erlang.mk/
+/apps/merge_raft/c_src/env.mk
+/apps/merge_raft/priv/*.dll
+/apps/merge_raft/priv/*.dylib
+/apps/merge_raft/priv/*.so
+/elp
+/erlfmt
+/rebar3

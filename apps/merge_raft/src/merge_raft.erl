@@ -2,6 +2,8 @@
 
 -module(merge_raft).
 -compile(warn_missing_spec_all).
+-author("zeyu@meta.com").
+-oncall("whatsapp_clr").
 -moduledoc """
 merge_raft behaviour
 """.
@@ -1283,6 +1285,7 @@ now_ns() ->
 peer_send({_StartNs, Pid}, Msg) ->
     % This required dist_auto_connect
     % Future: can be replaced by callback transports
+    % true = net_kernel:connect_node(node(Pid)),
     gen_server:cast(Pid, Msg).
 
 -spec last_log_tenure(#state{}) -> tenure_id().

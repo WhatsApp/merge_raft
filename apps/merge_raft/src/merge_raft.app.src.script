@@ -1,0 +1,37 @@
+%%%-----------------------------------------------------------------------------
+%%% %CopyrightBegin%
+%%%
+%%% SPDX-License-Identifier: Apache-2.0
+%%%
+%%% Copyright (c) Meta Platforms, Inc. and affiliates.
+%%% Copyright (c) WhatsApp LLC
+%%%
+%%% Licensed under the Apache License, Version 2.0 (the "License");
+%%% you may not use this file except in compliance with the License.
+%%% You may obtain a copy of the License at
+%%%
+%%%     http://www.apache.org/licenses/LICENSE-2.0
+%%%
+%%% Unless required by applicable law or agreed to in writing, software
+%%% distributed under the License is distributed on an "AS IS" BASIS,
+%%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%%% See the License for the specific language governing permissions and
+%%% limitations under the License.
+%%%
+%%% %CopyrightEnd%
+%%%-----------------------------------------------------------------------------
+%%% % @format
+%%% % @oncall whatsapp_clr
+
+SourceDir = filename:dirname(SCRIPT),
+AppDir = rebar_file_utils:absolute_path(filename:join([SourceDir, ".."])),
+ProjectDir = rebar_file_utils:absolute_path(filename:join([AppDir, "..", ".."])),
+
+FileNameList = ["CHANGELOG.md", "CODE_OF_CONDUCT.md", "CONTRIBUTING.md", "LICENSE.md", "README.md"],
+
+Sources = [filename:join([ProjectDir, FileName]) || FileName <- FileNameList],
+Dest = AppDir,
+Options = [{dereference, true}],
+ok = rebar_file_utils:cp_r(Sources, Dest, Options),
+
+CONFIG.

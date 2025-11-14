@@ -2,6 +2,8 @@
 
 -module(merge_raft_kv).
 -compile(warn_missing_spec_all).
+-author("zeyu@meta.com").
+-oncall("whatsapp_clr").
 -moduledoc """
 a simple key-value store with merge raft
 """.
