@@ -40,8 +40,10 @@ merge_raft behaviour
 
 -type server_name() :: atom().
 -type server_module() :: module().
+-type node_filter_fun() :: fun((node()) -> boolean()) | undefined.
+-type server_type() :: {registered, server_name(), node_filter_fun()} | {dynamic, [gen_server:server_ref()]}.
 -type options() :: #{
-    name := server_name(),
+    type := server_type(),
     module := server_module(),
     extra_logs => non_neg_integer()
 }.
@@ -73,7 +75,6 @@ merge_raft behaviour
 
 -define(HEARTBEAT_TIMEOUT_MS, (900 + rand:uniform(200))).
 -define(ELECTION_TIMEOUT_MS, (5000 + rand:uniform(5000))).
--define(LIVENESS_TIMEOUT_MS, (1 * 60 * 1000 + rand:uniform(5000))).
 -define(RESET_TIMEOUT_MS, (5 * 60 * 1000)).
 -define(TICK_MESSAGE, tick).
 -define(TICK_TIMEOUT_MS, 100).
@@ -154,15 +155,15 @@ merge_raft behaviour
     base_index = 0 :: log_id(),
     match_index = 0 :: log_id(),
     heartbeat_timeout_ms = 0 :: non_neg_integer(),
-    liveness_timeout_ms = 0 :: non_neg_integer(),
-    voted = false :: boolean()
+    voted = false :: boolean(),
+    monitor = undefined :: undefined | reference()
 }).
 
 -type member_tree() :: gb_trees:tree(log_id(), members()).
 -type peers() :: #{peer() => #peer_state{}}.
 
 -record(state, {
-    name :: server_name(),
+    type :: server_type(),
     module :: server_module(),
     options :: options(),
     me :: peer(),
@@ -181,6 +182,7 @@ merge_raft behaviour
     paused :: paused(),
     % holds all the known peers in branch tree until the peer is committed to leave
     peers :: peers(),
+    peer_monitors :: #{reference() => peer()},
     election_timeout_ms :: time_ms(),
     merge_timeout_ms :: time_ms(),
     reset_timeout_ms :: time_ms(),
@@ -246,43 +248,53 @@ child_spec(Option) ->
     }.
 
 -spec start_link(options()) -> gen_server:start_ret().
-start_link(#{name := Name, module := Module} = Option) when is_atom(Name), is_atom(Module) ->
-    gen_server:start_link({local, Name}, ?MODULE, Option, []).
+start_link(#{type := {registered, Name, _Fun}} = Options) ->
+    gen_server:start_link({local, Name}, ?MODULE, Options, []);
+start_link(Options) ->
+    gen_server:start_link(?MODULE, Options, []).
 
 -spec start(options()) -> gen_server:start_ret().
-start(#{name := Name, module := Module} = Option) when is_atom(Name), is_atom(Module) ->
-    gen_server:start({local, Name}, ?MODULE, Option, []).
+start(#{type := {registered, Name, _Fun}} = Options) ->
+    gen_server:start({local, Name}, ?MODULE, Options, []);
+start(Options) ->
+    gen_server:start(?MODULE, Options, []).
 
 %==============================================================================
 % API functions
 %==============================================================================
 
--spec commit_async(server_name(), custom_log()) -> ok.
-commit_async(Name, Log) ->
-    gen_server:cast(Name, #log_request{log = {custom, Log}}).
+-spec commit_async(gen_server:server_ref(), custom_log()) -> ok.
+commit_async(Server, Log) ->
+    gen_server:cast(Server, #log_request{log = {custom, Log}}).
 
--spec commit_sync(server_name(), custom_log()) -> {ok, custom_result()} | error().
-commit_sync(Name, Log) ->
-    commit_sync(Name, Log, 5000).
+-spec commit_sync(gen_server:server_ref(), custom_log()) -> {ok, custom_result()} | error().
+commit_sync(Server, Log) ->
+    commit_sync(Server, Log, 5000).
 
--spec commit_sync(server_name(), custom_log(), timeout()) -> {ok, custom_result()} | error().
-commit_sync(Name, Log, Timeout) ->
-    gen_server:call(Name, #log_request{log = {custom, Log}}, Timeout).
+-spec commit_sync(gen_server:server_ref(), custom_log(), timeout()) -> {ok, custom_result()} | error().
+commit_sync(Server, Log, Timeout) ->
+    gen_server:call(Server, #log_request{log = {custom, Log}}, Timeout).
 
 %==============================================================================
 % gen_server callbacks
 %==============================================================================
 
 -spec init(options()) -> {ok, #state{}}.
-init(#{name := Name, module := Module} = Options) ->
-    net_kernel:monitor_nodes(true),
-    process_flag(async_dist, true),
+init(#{type := Type, module := Module} = Options) ->
     process_flag(trap_exit, true),
     Me = {now_ns(), self()},
-    % Future: implement read from backup
-    {undefined, CustomDb} = Module:db_init(Me, Name),
+    {undefined, CustomDb} =
+        case Type of
+            {registered, Name, _Fun} ->
+                net_kernel:monitor_nodes(true),
+                process_flag(async_dist, true),
+                % Future: implement read from backup
+                Module:db_init(Me, Name);
+            {dynamic, _Peers} ->
+                Module:db_init(Me, undefined)
+        end,
     State = #state{
-        name = Name,
+        type = Type,
         module = Module,
         options = Options,
         me = Me,
@@ -300,6 +312,7 @@ init(#{name := Name, module := Module} = Options) ->
         member_tree = gb_trees:from_orddict([{1, #{Me => []}}]),
         paused = #{},
         peers = #{},
+        peer_monitors = #{},
         election_timeout_ms = 0,
         merge_timeout_ms = 0,
         reset_timeout_ms = now_ms() + ?RESET_TIMEOUT_MS,
@@ -390,14 +403,18 @@ handle_cast(
                 Peers1 = (State#state.peers)#{From => (map_get(From, State#state.peers))#peer_state{voted = true}},
                 State1 = State#state{peers = Peers1},
                 Members = committed_members(State1),
-                Quorum = (map_size(Members) + 1) div 2,
+                Quorum = (map_size(Members) div 2) + 1,
                 % Can be optimized to cache vote count but overkill right now
                 Votes = [1 || Peer := _ <- Members, Peer =/= State1#state.me, (map_get(Peer, Peers1))#peer_state.voted],
                 Voted = length(Votes) + 1,
                 if
-                    Voted + 1 >= Quorum ->
+                    Voted >= Quorum ->
                         [send_empty_append(Peer, State1) || Peer := _ <- Members, Peer =/= State1#state.me],
-                        NowMs = now_ms(),
+                        Monitors =
+                            #{
+                                Peer => erlang:monitor(process, Pid, [{tag, peer_down}])
+                             || {_, Pid} = Peer := _PeerState <- Peers1
+                            },
                         State2 = State1#state{
                             role = leader,
                             leader = State1#state.me,
@@ -405,11 +422,12 @@ handle_cast(
                                 #{
                                     Peer => PeerState#peer_state{
                                         base_index = State1#state.append_index,
-                                        heartbeat_timeout_ms = NowMs + ?HEARTBEAT_TIMEOUT_MS,
-                                        liveness_timeout_ms = NowMs + ?LIVENESS_TIMEOUT_MS
+                                        heartbeat_timeout_ms = now_ms() + ?HEARTBEAT_TIMEOUT_MS,
+                                        monitor = map_get(Peer, Monitors)
                                     }
                                  || Peer := PeerState <- Peers1
-                                }
+                                },
+                            peer_monitors = #{Ref => Peer || Peer := Ref <- Monitors}
                         },
                         State3 = insert(make_ref(), {leader, State#state.me}, State2),
                         % Questionable, maybe too expensive to do this on every leader change?
@@ -527,15 +545,11 @@ handle_cast(
                             case Result of
                                 success ->
                                     PeerState#peer_state{
-                                        match_index = max(PeerState#peer_state.match_index, PeerAppendId),
-                                        liveness_timeout_ms = now_ms() + ?LIVENESS_TIMEOUT_MS
+                                        match_index = max(PeerState#peer_state.match_index, PeerAppendId)
                                     };
                                 % Change the sending base index if conflict happens or peer needs older data
                                 need_older ->
-                                    PeerState#peer_state{
-                                        base_index = PeerAppendId,
-                                        liveness_timeout_ms = now_ms() + ?LIVENESS_TIMEOUT_MS
-                                    };
+                                    PeerState#peer_state{base_index = PeerAppendId};
                                 not_leader ->
                                     PeerState
                             end
@@ -615,10 +629,11 @@ handle_cast(_Request, State) ->
     {noreply, State}.
 
 -spec handle_info(Request, #state{}) -> {noreply, #state{}} | {stop, exit, #state{}} when
-    Request :: TickMsg | Nodeup | Nodedown | ExitMsg,
+    Request :: TickMsg | Nodeup | Nodedown | PeerDown | ExitMsg,
     TickMsg :: ?TICK_MESSAGE,
     Nodeup :: {nodeup, Node :: node()},
     Nodedown :: {nodedown, Node :: node()},
+    PeerDown :: {peer_down, MonitorRef :: reference(), process, Pid :: pid(), Reason :: term()},
     ExitMsg :: {'EXIT', Pid :: pid(), Reason :: term()}.
 % leader tick
 handle_info(?TICK_MESSAGE, State) when State#state.role =:= leader ->
@@ -629,7 +644,6 @@ handle_info(?TICK_MESSAGE, State) when State#state.role =:= leader ->
         if
             map_size(State1#state.paused) =:= 0 ->
                 % Check below quorum here
-                % Kick leaved node here
                 State1;
             map_size(State1#state.paused) > 0,
             NowMs > State1#state.merge_timeout_ms,
@@ -644,29 +658,7 @@ handle_info(?TICK_MESSAGE, State) when State#state.role =:= leader ->
             true ->
                 State1
         end,
-    % Dedupe peers and kick dead peers
-    % Can be optimized
-    AppendMembers2 = appended_members(State2),
-    State3 = lists:foldl(
-        fun(ToLeave, StateAcc) ->
-            insert(make_ref(), {leave, ToLeave}, StateAcc)
-        end,
-        State2,
-        [
-            PeerA
-         || {_, PidA} = PeerA := _ <- AppendMembers2,
-            {_, PidB} = PeerB := _ <- AppendMembers2,
-            node(PidA) =:= node(PidB),
-            PeerA < PeerB
-        ] ++
-            [
-                Peer
-             || Peer := #peer_state{liveness_timeout_ms = LivenessTimeoutMs} <- State2#state.peers,
-                is_map_key(Peer, AppendMembers2),
-                NowMs > LivenessTimeoutMs
-            ]
-    ),
-    {noreply, maybe_reset(State3)};
+    {noreply, maybe_reset(State2)};
 % non-leader tick
 handle_info(?TICK_MESSAGE, State) ->
     erlang:send_after(?TICK_TIMEOUT_MS, self(), ?TICK_MESSAGE),
@@ -683,16 +675,11 @@ handle_info({_NodeUpDown, Node}, State) when Node =:= node() ->
 handle_info({nodeup, Node}, State) when State#state.role =:= leader ->
     State1 = discover(Node, State),
     {noreply, State1};
-handle_info({nodedown, Node}, State) when State#state.role =:= leader ->
-    % Questionable: leave all disconnected peers
-    State1 = lists:foldl(
-        fun(ToLeave, StateAcc) ->
-            insert(make_ref(), {leave, ToLeave}, StateAcc)
-        end,
-        State,
-        [Peer || {_, Pid} = Peer := _ <- appended_members(State), node(Pid) =:= Node]
-    ),
-    {noreply, State1};
+handle_info({peer_down, Ref, process, _Pid, _Reason}, State) when
+    State#state.role =:= leader,
+    is_map_key(Ref, State#state.peer_monitors)
+->
+    {noreply, insert(make_ref(), {leave, map_get(Ref, State#state.peer_monitors)}, State)};
 handle_info({'EXIT', _, _}, State) ->
     {stop, exit, State};
 handle_info(_Info, State) ->
@@ -711,17 +698,28 @@ terminate(_Reason, State) ->
 
 % Try to see if there is any other cluster that we can merge
 -spec discover(#state{}) -> #state{}.
-discover(State) ->
-    lists:foldl(fun discover/2, State, nodes()).
+discover(#state{type = {registered, _Name, _NodeFilterFun}} = State) ->
+    lists:foldl(fun discover/2, State, nodes());
+discover(#state{type = {dynamic, Peers}} = State) ->
+    lists:foldl(fun discover/2, State, Peers).
 
--spec discover(peer() | node(), #state{}) -> #state{}.
-discover(Peer, State) ->
+-spec discover(peer() | node() | gen_server:server_ref(), #state{}) -> #state{}.
+discover(Target, State) ->
     gen_server:cast(
-        case Peer of
-            {_StartNs, Pid} when is_pid(Pid) ->
+        case {Target, State#state.type} of
+            {Node, {registered, Name, undefined}} when is_atom(Node) ->
+                {Name, Node};
+            {Node, {registered, Name, NodeFilterFun}} when is_atom(Node) ->
+                case NodeFilterFun(Node) of
+                    true ->
+                        {Name, Node};
+                    false ->
+                        undefined
+                end;
+            {{_StartNs, Pid}, _} when is_pid(Pid) ->
                 Pid;
-            Node ->
-                {State#state.name, Node}
+            {D, _} ->
+                D
         end,
         #discover{
             from = State#state.me,
@@ -911,7 +909,7 @@ maybe_commit(State) ->
                 is_map_key(Peer, State#state.peers)
             ]
     ),
-    case lists:nth((map_size(Members) + 1) div 2, MatchList) of
+    case lists:nth((map_size(Members) div 2) + 1, MatchList) of
         CommitIndex when
             CommitIndex > State#state.commit_index,
             element(1, map_get(CommitIndex, State#state.logs)) =:= State#state.tenure_id
@@ -1027,6 +1025,7 @@ reply(_LogRef, _Message, State) ->
 % Switch to follower when peer tenure is higher than us
 -spec to_follower(branch(), tenure_id(), #state{}) -> #state{}.
 to_follower(PeerBranch, PeerTenureId, State) ->
+    [erlang:demonitor(Ref) || Ref := _ <- State#state.peer_monitors],
     State#state{
         role = follower,
         branch = PeerBranch,
@@ -1037,6 +1036,7 @@ to_follower(PeerBranch, PeerTenureId, State) ->
         % Questionable if we should let candidate send to not committed merge peers
         % Leave it here for now
         wait_snapshot = State#state.wait_snapshot orelse (PeerBranch < State#state.branch),
+        peer_monitors = #{},
         election_timeout_ms = now_ms() + ?ELECTION_TIMEOUT_MS
     }.
 
@@ -1077,9 +1077,10 @@ reset(#state{me = {OldNs, Pid}} = State) ->
                 OldNs + 1
         end,
     Me = {NowNs, Pid},
+    [erlang:demonitor(Ref) || Ref := _ <- State#state.peer_monitors],
     [Ref ! {error, reset} || Ref := _ <- State#state.replies],
     #state{
-        name = State#state.name,
+        type = State#state.type,
         module = State#state.module,
         options = State#state.options,
         me = Me,
@@ -1097,6 +1098,7 @@ reset(#state{me = {OldNs, Pid}} = State) ->
         member_tree = gb_trees:from_orddict([{1, #{Me => []}}]),
         paused = #{},
         peers = #{},
+        peer_monitors = #{},
         election_timeout_ms = 0,
         merge_timeout_ms = 0,
         reset_timeout_ms = now_ms() + ?RESET_TIMEOUT_MS,
@@ -1130,34 +1132,45 @@ append({LogId, {_TenureId, _LogRef, Log} = LogValue}, State) ->
     State1 =
         case Log of
             {merge, Members, _CustomDbSerialized} ->
-                NowMembers = maps:merge(get_members(LogId - 1, State), Members),
-                NowMs = now_ms(),
-                State#state{
-                    member_tree = gb_trees:insert(LogId, NowMembers, State#state.member_tree),
-                    peers = maps:merge(
-                        State#state.peers,
-                        #{
-                            Peer =>
-                                case State#state.role of
-                                    leader ->
-                                        #peer_state{
-                                            base_index = State#state.append_index,
-                                            heartbeat_timeout_ms = NowMs + ?HEARTBEAT_TIMEOUT_MS,
-                                            liveness_timeout_ms = NowMs + ?LIVENESS_TIMEOUT_MS
-                                        };
-                                    _ ->
-                                        #peer_state{}
-                                end
-                         || Peer := _ <- Members
+                NewMembers = maps:merge(get_members(LogId - 1, State), Members),
+                case State#state.role of
+                    leader ->
+                        Monitors =
+                            #{
+                                Peer => erlang:monitor(process, Pid, [{tag, peer_down}])
+                             || {_, Pid} = Peer := _ <- Members
+                            },
+                        State#state{
+                            member_tree = gb_trees:insert(LogId, NewMembers, State#state.member_tree),
+                            peers = maps:merge(
+                                State#state.peers,
+                                #{
+                                    Peer => #peer_state{
+                                        base_index = State#state.append_index,
+                                        heartbeat_timeout_ms = now_ms() + ?HEARTBEAT_TIMEOUT_MS,
+                                        monitor = map_get(Peer, Monitors)
+                                    }
+                                 || Peer := _ <- Members
+                                }
+                            ),
+                            peer_monitors = maps:merge(
+                                State#state.peer_monitors,
+                                #{Ref => Peer || Peer := Ref <- Monitors}
+                            )
+                        };
+                    _ ->
+                        State#state{
+                            member_tree = gb_trees:insert(LogId, NewMembers, State#state.member_tree),
+                            peers = maps:merge(State#state.peers, #{Peer => #peer_state{} || Peer := _ <- Members})
                         }
-                    )
-                };
+                end;
             {leave, Peer} ->
-                NowMembers = maps:remove(Peer, get_members(LogId - 1, State)),
-                State#state{member_tree = gb_trees:insert(LogId, NowMembers, State#state.member_tree)};
+                NewMembers = maps:remove(Peer, get_members(LogId - 1, State)),
+                State#state{member_tree = gb_trees:insert(LogId, NewMembers, State#state.member_tree)};
             {pause, Paused} ->
                 State#state{paused = Paused};
             {snapshot, Members, Paused, CustomDbSerialized} ->
+                State#state.role =:= leader andalso error("leader append snapshot"),
                 CustomDb = (State#state.module):apply_replace(CustomDbSerialized, State#state.custom_db),
                 State#state{
                     wait_snapshot = false,
@@ -1236,7 +1249,15 @@ do_apply(_LogId, State) ->
             State#state{
                 apply_index = State#state.apply_index + 1,
                 custom_db = CustomDb,
-                peers = maps:remove(Peer, State#state.peers)
+                peers = maps:remove(Peer, State#state.peers),
+                peer_monitors =
+                    case State#state.peers of
+                        #{Peer := #peer_state{monitor = Ref}} ->
+                            Ref =/= undefined andalso erlang:demonitor(Ref),
+                            maps:remove(Ref, State#state.peer_monitors);
+                        _ ->
+                            State#state.peer_monitors
+                    end
             };
         {_TenureId, _LogRef, {leader, _Peer}} ->
             State#state{apply_index = State#state.apply_index + 1};

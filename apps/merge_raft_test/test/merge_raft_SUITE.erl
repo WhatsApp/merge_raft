@@ -110,8 +110,8 @@ kv(_Config) ->
     % Connect nodes in a chain
     true = merge_raft_test_peer_set:connect(PeerSet, 2, 1),
     true = merge_raft_test_peer_set:connect(PeerSet, 3, 2),
-    true = merge_raft_test_peer_set:connect(PeerSet, 4, 3),
     true = merge_raft_test_peer_set:connect(PeerSet, 5, 4),
+    true = merge_raft_test_peer_set:connect(PeerSet, 4, 3),
     % Allow time for cluster merge
     ?WAIT_UNTIL(#{5 := #{1 := _, 4 := _}} = merge_raft_test_peer_set:graph_set(PeerSet), 10_000),
     ?WAIT_UNTIL({ok, 1} = merge_raft_test_peer_set:call(PeerSet, 5, merge_raft_kv, async_get, [?FUNCTION_NAME, a])),

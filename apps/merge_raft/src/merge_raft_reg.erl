@@ -172,7 +172,7 @@ reset(_Me, Db) ->
 
 -spec init([]) -> {ok, state()}.
 init([]) ->
-    merge_raft:start_link(#{name => ?RAFT_SERVER, module => ?MODULE}),
+    merge_raft:start_link(#{type => {registered, ?RAFT_SERVER, undefined}, module => ?MODULE}),
     {ok, #{}}.
 
 -spec handle_call(dynamic(), gen_server:from(), state()) -> {reply, boolean(), state()}.

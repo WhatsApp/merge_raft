@@ -48,6 +48,8 @@ a simple gen_server implementing connect_all feature using merge raft
 
 -type state() :: #{node() => up | reference()}.
 
+-define(RAFT_SERVER, merge_raft_node_server).
+
 %==============================================================================
 % OTP supervision
 %==============================================================================
@@ -112,7 +114,7 @@ reset({_, Pid} = _Me, _Db) ->
 init([]) ->
     net_kernel:monitor_nodes(true),
     process_flag(async_dist, true),
-    merge_raft:start_link(#{name => merge_raft_nodes_server, module => ?MODULE}),
+    merge_raft:start_link(#{type => {registered, ?RAFT_SERVER, undefined}, module => ?MODULE}),
     {ok, #{Node => up || Node <- nodes()}}.
 
 -spec handle_call(dynamic(), gen_server:from(), state()) -> no_return().

@@ -57,15 +57,15 @@ a simple key-value store with merge raft
 
 -spec child_spec(server_name()) -> supervisor:child_spec().
 child_spec(Name) ->
-    merge_raft:child_spec(#{name => Name, module => ?MODULE}).
+    merge_raft:child_spec(#{type => {registered, Name, undefined}, module => ?MODULE}).
 
 -spec start_link(server_name()) -> gen_server:start_ret().
 start_link(Name) ->
-    merge_raft:start_link(#{name => Name, module => ?MODULE}).
+    merge_raft:start_link(#{type => {registered, Name, undefined}, module => ?MODULE}).
 
 -spec start(server_name()) -> gen_server:start_ret().
 start(Name) ->
-    merge_raft:start(#{name => Name, module => ?MODULE}).
+    merge_raft:start(#{type => {registered, Name, undefined}, module => ?MODULE}).
 
 %==============================================================================
 % API functions
