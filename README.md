@@ -10,7 +10,26 @@ TBD
 
 ## Usage
 
-TBD
+```
+rebar3 shell
+```
+Node 1:
+```
+merge_raft_kv:start(kv).
+net_kernel:start('1@localhost', #{name_domain => shortnames}).
+merge_raft_kv:async_put(kv, key, value).
+```
+Node 2:
+```
+merge_raft_kv:start(kv).
+net_kernel:start('2@localhost', #{name_domain => shortnames}).
+net_kernel:connect_node('1@localhost').
+merge_raft_kv:sync_get(kv, key).
+```
+
+## Testing
+
+rebar3 ct
 
 ## License
 
