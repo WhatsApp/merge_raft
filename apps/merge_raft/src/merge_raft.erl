@@ -24,6 +24,12 @@ merge_raft behaviour
     commit_sync/3
 ]).
 
+%% Debug functions
+-export([
+    connect/2,
+    get_info/1
+]).
+
 %% gen_server callbacks
 -export([
     init/1,
@@ -43,8 +49,8 @@ merge_raft behaviour
 -type node_filter_fun() :: fun((node()) -> boolean()) | undefined.
 -type server_type() :: {registered, server_name(), node_filter_fun()} | {dynamic, [gen_server:server_ref()]}.
 -type options() :: #{
-    type := server_type(),
     module := server_module(),
+    type => server_type(),
     extra_logs => non_neg_integer()
 }.
 -type error() :: {error, dynamic()}.
@@ -81,6 +87,8 @@ merge_raft behaviour
 -define(MERGE_TIMEOUT_MS, (1 * 1000)).
 -define(BATCH_SIZE, 100).
 -define(REDIRECT, 1).
+
+-define(DBG(F, As), debug_format("~w: ~w: " ++ F, [?LINE, self() | As])).
 
 % Send to state.peers
 % Vote if sender tenure is higher or equal and receiver is not voted, even if sender is not in state.peers
@@ -276,12 +284,25 @@ commit_sync(Server, Log, Timeout) ->
     gen_server:call(Server, #log_request{log = {custom, Log}}, Timeout).
 
 %==============================================================================
+% Debug functions
+%==============================================================================
+
+-spec connect(gen_server:server_ref(), [gen_server:server_ref()]) -> ok | not_supported.
+connect(Server, Servers) ->
+    gen_server:call(Server, {connect, Servers}).
+
+-spec get_info(gen_server:server_ref()) -> map().
+get_info(Server) ->
+    gen_server:call(Server, get_info).
+
+%==============================================================================
 % gen_server callbacks
 %==============================================================================
 
 -spec init(options()) -> {ok, #state{}}.
-init(#{type := Type, module := Module} = Options) ->
+init(#{module := Module} = Options) ->
     process_flag(trap_exit, true),
+    Type = maps:get(type, Options, {dynamic, []}),
     Me = {now_ns(), self()},
     {undefined, CustomDb} =
         case Type of
@@ -327,10 +348,18 @@ init(#{type := Type, module := Module} = Options) ->
 -dialyzer({nowarn_function, handle_call/3}).
 -spec handle_call
     (#log_request{}, {pid(), [alias | reference()]}, #state{}) -> {noreply, #state{}};
+    ({connect, [gen_server:server_ref()]}, gen_server:from(), #state{}) -> {reply, ok | not_supported, #state{}};
+    (get_info, gen_server:from(), #state{}) -> {reply, map(), #state{}};
     (dynamic(), gen_server:from(), #state{}) -> {reply, not_supported, #state{}}.
 handle_call(#log_request{} = LogRequest, {_Pid, [alias | Alias]}, State) ->
     % eqwalizer:ignore bad multi-function support
     handle_cast(LogRequest#log_request{reply_to = Alias}, State);
+handle_call({connect, Servers}, _From, #state{type = {dynamic, _}} = State) ->
+    % eqwalizer:ignore bad multi-function support
+    {reply, ok, discover(State#state{type = {dynamic, Servers}})};
+handle_call(get_info, _From, State) ->
+    % eqwalizer:ignore bad multi-function support
+    {reply, get_info_impl(State), State};
 handle_call(_Request, _From, State) ->
     % eqwalizer:ignore bad multi-function support
     {reply, not_supported, State}.
@@ -356,15 +385,22 @@ handle_cast(
     State
 ) when To =:= State#state.me ->
     Succeeded =
-        PeerBranch < State#state.branch orelse
-            (PeerBranch =:= State#state.branch andalso
-                (PeerTenureId > State#state.tenure_id orelse
-                    (PeerTenureId =:= State#state.tenure_id andalso
-                        (State#state.leader =:= From orelse State#state.leader =:= undefined) andalso
-                        (State#state.voted_for =:= From orelse
-                            (State#state.voted_for =:= undefined andalso
-                                {PeerLastLogTerm, PeerLastLogIndex} >=
-                                    {last_log_tenure(State), State#state.append_index}))))),
+        if
+            PeerBranch < State#state.branch -> true;
+            PeerBranch > State#state.branch -> false;
+            %% Equal Branch
+            PeerTenureId > State#state.tenure_id -> true;
+            PeerTenureId < State#state.tenure_id -> false;
+            %% And equal TenureId
+            State#state.leader =:= From orelse State#state.leader =:= undefined ->
+                case State#state.voted_for of
+                    From -> true;
+                    undefined ->
+                        {PeerLastLogTerm, PeerLastLogIndex} >= {last_log_tenure(State), State#state.append_index};
+                    _ -> false
+                end;
+            true -> false
+        end,
     State1 =
         case Succeeded of
             true ->
@@ -512,10 +548,12 @@ handle_cast(
             tenure_id = State2#state.tenure_id,
             result = Result,
             append_id =
-                case State2#state.wait_snapshot of
-                    true ->
+                if
+                    State2#state.wait_snapshot ->
                         0;
-                    _ ->
+                    Result =:= success ->
+                        State2#state.append_index;
+                    true ->
                         min(State2#state.append_index, PrevLogIndex)
                 end
         }
@@ -593,10 +631,10 @@ handle_cast(
                 State1
         end,
     {noreply, State2};
-handle_cast(#log_request{reply_to = Ref, log = Log} = LogRequest, State) when
+handle_cast(#log_request{reply_to = Ref, log = Log}, State) when
     State#state.role =:= leader
 ->
-    State1 = maybe_single_member_commit(insert(Ref, Log, maybe_prepare_reply(LogRequest, State))),
+    State1 = maybe_single_member_commit(insert(Ref, Log, State#state{replies = (State#state.replies)#{Ref => []}})),
     % Future: not always do a immediate send, batch a little bit
     State2 = lists:foldl(fun maybe_send_append/2, State1, maps:keys(committed_members(State1)) -- [State1#state.me]),
     {noreply, State2};
@@ -605,7 +643,7 @@ handle_cast(#log_request{redirect = Redirect} = LogRequest, State) when
     Redirect > 0
 ->
     peer_send(State#state.leader, LogRequest#log_request{redirect = Redirect - 1}),
-    {noreply, maybe_prepare_reply(LogRequest, State)};
+    {noreply, State};
 handle_cast(#discover{from = From, branch = PeerBranch, members = Members}, State) when
     State#state.role =:= leader andalso not is_map_key(From, State#state.peers) andalso
         map_size(State#state.paused) =:= 0 andalso PeerBranch =/= State#state.branch
@@ -909,26 +947,29 @@ maybe_commit(State) ->
                 is_map_key(Peer, State#state.peers)
             ]
     ),
-    case lists:nth((map_size(Members) div 2) + 1, MatchList) of
-        CommitIndex when
-            CommitIndex > State#state.commit_index,
+    CommitIndex = lists:nth((map_size(Members) + 1) div 2, MatchList),
+    ?DBG(
+        "commit ~w(~w) => ~w > ~w = ~w~n",
+        [MatchList, (map_size(Members) + 1) div 2, CommitIndex,
+            State#state.commit_index, CommitIndex > State#state.commit_index]
+    ),
+    case
+        CommitIndex > State#state.commit_index andalso
             element(1, map_get(CommitIndex, State#state.logs)) =:= State#state.tenure_id
-        ->
-            case IsMerge of
-                true ->
-                    maybe_commit(commit(NextIndex, State#state{reset_timeout_ms = now_ms() + ?RESET_TIMEOUT_MS}));
+    of
+        true when IsMerge ->
+            maybe_commit(commit(NextIndex, State#state{reset_timeout_ms = now_ms() + ?RESET_TIMEOUT_MS}));
+        true ->
+            case gb_trees:larger(NextIndex, State#state.member_tree) of
+                {MemberChangeIndex, _} when MemberChangeIndex =< CommitIndex ->
+                    maybe_commit(
+                        commit(
+                            MemberChangeIndex - 1,
+                            State#state{reset_timeout_ms = now_ms() + ?RESET_TIMEOUT_MS}
+                        )
+                    );
                 _ ->
-                    case gb_trees:larger(NextIndex, State#state.member_tree) of
-                        {MemberChangeIndex, _} when MemberChangeIndex =< CommitIndex ->
-                            maybe_commit(
-                                commit(
-                                    MemberChangeIndex - 1,
-                                    State#state{reset_timeout_ms = now_ms() + ?RESET_TIMEOUT_MS}
-                                )
-                            );
-                        _ ->
-                            commit(CommitIndex, State#state{reset_timeout_ms = now_ms() + ?RESET_TIMEOUT_MS})
-                    end
+                    commit(CommitIndex, State#state{reset_timeout_ms = now_ms() + ?RESET_TIMEOUT_MS})
             end;
         _ ->
             State
@@ -1005,12 +1046,6 @@ send_election(Peer, State) ->
 %==============================================================================
 % common functions
 %==============================================================================
-
--spec maybe_prepare_reply(#log_request{}, #state{}) -> #state{}.
-maybe_prepare_reply(#log_request{redirect = ?REDIRECT, reply_to = ReplyTo}, State) ->
-    State#state{replies = (State#state.replies)#{ReplyTo => []}};
-maybe_prepare_reply(_LogRequest, State) ->
-    State.
 
 % erlint-ignore dialyzer_override
 -dialyzer({nowarn_function, reply/3}).
@@ -1217,12 +1252,15 @@ delete(_LogId, State) ->
 -spec commit(log_id(), #state{}) -> #state{}.
 commit(LogId, State) ->
     % Future: make this async
-    do_apply(LogId, State#state{commit_index = min(max(LogId, State#state.commit_index), State#state.append_index)}).
+    CommitIndex = min(max(LogId, State#state.commit_index), State#state.append_index),
+    lists:foldl(
+        fun apply_one/2,
+        State#state{commit_index = CommitIndex},
+        lists:seq(State#state.apply_index + 1, CommitIndex)
+    ).
 
--spec do_apply(log_id(), #state{}) -> #state{}.
-do_apply(LogId, State) when LogId < State#state.apply_index; State#state.apply_index >= State#state.commit_index ->
-    State;
-do_apply(_LogId, State) ->
+-spec apply_one(log_id(), #state{}) -> #state{}.
+apply_one(_LogId, State) ->
     case map_get(State#state.apply_index + 1, State#state.logs) of
         {TenureId, LogRef, {custom, CustomLog}} ->
             CommitMetadata = {State#state.branch, State#state.apply_index, TenureId, LogRef},
@@ -1269,27 +1307,32 @@ do_apply(_LogId, State) ->
     end.
 
 -spec cleanup(log_id(), #state{}) -> #state{}.
-cleanup(LogId, State) when LogId < State#state.cleanup_index; State#state.cleanup_index >= State#state.apply_index ->
-    State;
-cleanup(_LogId, State) ->
-    CleanupLogId = State#state.cleanup_index - maps:get(extra_logs, State#state.options, 1000),
-    State#state{
-        logs = maps:remove(CleanupLogId, State#state.logs),
-        member_tree =
-            case gb_trees:is_defined(CleanupLogId + 1, State#state.member_tree) of
-                true ->
-                    gb_trees:delete_any(CleanupLogId, State#state.member_tree);
-                _ ->
-                    case gb_trees:take_any(CleanupLogId, State#state.member_tree) of
-                        {Members, MemberTree} ->
-                            % eqwalizer:ignore gb_trees:take_any is not dynamic()
-                            gb_trees:insert(CleanupLogId + 1, Members, MemberTree);
+cleanup(LogId, State) ->
+    CleanupIndex = min(max(LogId, State#state.cleanup_index), State#state.commit_index),
+    lists:foldl(
+        fun(_LogId, StateAcc) ->
+            CleanupLogId = StateAcc#state.cleanup_index - maps:get(extra_logs, StateAcc#state.options, 1000),
+            StateAcc#state{
+                logs = maps:remove(CleanupLogId, StateAcc#state.logs),
+                member_tree =
+                    case gb_trees:is_defined(CleanupLogId + 1, StateAcc#state.member_tree) of
+                        true ->
+                            gb_trees:delete_any(CleanupLogId, StateAcc#state.member_tree);
                         _ ->
-                            State#state.member_tree
-                    end
-            end,
-        cleanup_index = State#state.cleanup_index + 1
-    }.
+                            case gb_trees:take_any(CleanupLogId, StateAcc#state.member_tree) of
+                                {Members, MemberTree} ->
+                                    % eqwalizer:ignore gb_trees:take_any is not dynamic()
+                                    gb_trees:insert(CleanupLogId + 1, Members, MemberTree);
+                                _ ->
+                                    StateAcc#state.member_tree
+                            end
+                    end,
+                cleanup_index = StateAcc#state.cleanup_index + 1
+            }
+        end,
+        State,
+        lists:seq(State#state.cleanup_index + 1, CleanupIndex)
+    ).
 
 %==============================================================================
 % util functions
@@ -1336,3 +1379,27 @@ get_members(LogId, State) ->
         none ->
             error("bad member tree")
     end.
+
+%==============================================================================
+% debug functions
+%==============================================================================
+
+-spec get_info_impl(#state{}) -> map().
+get_info_impl(State) ->
+    #{
+        id => State#state.me,
+        leader => State#state.leader,
+        role => State#state.role,
+        idx_tenure => State#state.tenure_id,
+        idx_append => State#state.append_index,
+        idx_commit => State#state.commit_index,
+        idx_apply => State#state.apply_index,
+        member_peers => lists:sort([State#state.me | maps:keys(State#state.peers)]),
+        member_all => appended_members(State)
+    }.
+
+-spec debug_format(string(), list()) -> ok.
+debug_format(_F, _As) ->
+    %% mr_cb_test tracing will print this
+    %% io:format(_F, _As),
+    ok.
