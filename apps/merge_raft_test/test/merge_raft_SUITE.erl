@@ -139,7 +139,7 @@ connect(_Config) ->
     mr_cb_test:verify(Pids, [{a, 1}, {b, 2}]),
     {Time, {ok, 2}} = timer:tc(fun() -> mr_cb_test:leader_get(Pid3, b) end),
     ct:log("Read took: ~w µs", [Time]),
-    true = Time < 500_000,
+    true = Time < 100_000,
 
     mr_cb_test:cleanup({Pids, Mons}).
 
@@ -181,8 +181,8 @@ leader_dies(_Config) ->
     exit(Pid1, kill),
     ok = receive {'DOWN', _Mon, process, Pid1, killed} -> ok end,
 
-    % Leader election happens after 5 seconds
-    timer:sleep(10000),
+    % Leader election happens after 5 seconds, maximum 6 seconds
+    timer:sleep(6_000),
 
     {ok, ok} = mr_cb_test:put(Pid3, c, 3),
     ct:log("~w", [mr_cb_test:sync(Pids -- [Pid1])]),

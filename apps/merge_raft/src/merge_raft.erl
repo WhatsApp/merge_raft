@@ -51,7 +51,15 @@ merge_raft behaviour
 -type options() :: #{
     module := server_module(),
     type => server_type(),
-    extra_logs => non_neg_integer()
+    target_cluster_size => pos_integer(),
+    tick_timeout_ms => pos_integer(),
+    heartbeat_timeout_ms => pos_integer(),
+    election_variance_ms => pos_integer(),
+    election_timeout_ms => pos_integer(),
+    reset_timeout_ms => pos_integer(),
+    merge_timeout_ms => pos_integer(),
+    batch_size => pos_integer(),
+    log_history_len => non_neg_integer()
 }.
 -type error() :: {error, dynamic()}.
 
@@ -79,14 +87,16 @@ merge_raft behaviour
 
 -type commit_metadata() :: {branch(), log_id(), tenure_id(), log_ref()}.
 
--define(HEARTBEAT_TIMEOUT_MS, (900 + rand:uniform(200))).
--define(ELECTION_TIMEOUT_MS, (5000 + rand:uniform(5000))).
--define(RESET_TIMEOUT_MS, (5 * 60 * 1000)).
--define(TICK_MESSAGE, tick).
--define(TICK_TIMEOUT_MS, 100).
--define(MERGE_TIMEOUT_MS, (1 * 1000)).
--define(BATCH_SIZE, 100).
 -define(REDIRECT, 1).
+-define(TICK_MESSAGE, tick).
+-define(HEARTBEAT_TIMEOUT(State), (now_ms() + map_get(heartbeat_timeout_ms, State#state.options))).
+-define(ELECTION_TIMEOUT(State), (now_ms() + map_get(election_timeout_ms, State#state.options) +
+    rand:uniform(map_get(election_variance_ms, State#state.options)))).
+-define(RESET_TIMEOUT(State), (now_ms() + map_get(reset_timeout_ms, State#state.options))).
+-define(TICK_TIMEOUT(State), map_get(tick_timeout_ms, State#state.options)).
+-define(MERGE_TIMEOUT(State), (now_ms() + map_get(merge_timeout_ms, State#state.options))).
+-define(BATCH_SIZE(State), map_get(batch_size, State#state.options)).
+-define(LOG_HISTORY_LEN(State), map_get(log_history_len, State#state.options)).
 
 -define(DBG(F, As), debug_format("~w: ~w: " ++ F, [?LINE, self() | As])).
 
@@ -303,6 +313,18 @@ get_info(Server) ->
 init(#{module := Module} = Options) ->
     process_flag(trap_exit, true),
     Type = maps:get(type, Options, {dynamic, []}),
+    TargetClusterSize = maps:get(target_cluster_size, Options, 5),
+    DefaultOptions =
+        #{
+            heartbeat_timeout_ms => 20 * TargetClusterSize,
+            tick_timeout_ms => 25 * TargetClusterSize,
+            election_variance_ms => 100 * TargetClusterSize,
+            election_timeout_ms => 5000,
+            reset_timeout_ms => 300_000,
+            merge_timeout_ms => 200 * TargetClusterSize,
+            batch_size => 100,
+            log_history_len => 1000
+        },
     Me = {now_ns(), self()},
     {undefined, CustomDb} =
         case Type of
@@ -317,7 +339,7 @@ init(#{module := Module} = Options) ->
     State = #state{
         type = Type,
         module = Module,
-        options = Options,
+        options = maps:merge(DefaultOptions, Options),
         me = Me,
         role = leader,
         branch = Me,
@@ -336,12 +358,12 @@ init(#{module := Module} = Options) ->
         peer_monitors = #{},
         election_timeout_ms = 0,
         merge_timeout_ms = 0,
-        reset_timeout_ms = now_ms() + ?RESET_TIMEOUT_MS,
+        reset_timeout_ms = 0,
         custom_db = CustomDb,
         replies = #{}
     },
-    State1 = discover(State),
-    erlang:send_after(?TICK_TIMEOUT_MS, self(), ?TICK_MESSAGE),
+    State1 = discover(State#state{reset_timeout_ms = ?RESET_TIMEOUT(State)}),
+    erlang:send_after(?TICK_TIMEOUT(State), self(), ?TICK_MESSAGE),
     {ok, State1}.
 
 % erlint-ignore dialyzer_override
@@ -458,7 +480,7 @@ handle_cast(
                                 #{
                                     Peer => PeerState#peer_state{
                                         base_index = State1#state.append_index,
-                                        heartbeat_timeout_ms = now_ms() + ?HEARTBEAT_TIMEOUT_MS,
+                                        heartbeat_timeout_ms = ?HEARTBEAT_TIMEOUT(State1),
                                         monitor = map_get(Peer, Monitors)
                                     }
                                  || Peer := PeerState <- Peers1
@@ -510,8 +532,8 @@ handle_cast(
                             _ ->
                                 State#state.voted_for
                         end,
-                    election_timeout_ms = now_ms() + ?ELECTION_TIMEOUT_MS,
-                    reset_timeout_ms = now_ms() + ?RESET_TIMEOUT_MS
+                    election_timeout_ms = ?ELECTION_TIMEOUT(State),
+                    reset_timeout_ms = ?RESET_TIMEOUT(State)
                 };
             true ->
                 State
@@ -676,7 +698,7 @@ handle_cast(_Request, State) ->
 % leader tick
 handle_info(?TICK_MESSAGE, State) when State#state.role =:= leader ->
     NowMs = now_ms(),
-    erlang:send_after(?TICK_TIMEOUT_MS, self(), ?TICK_MESSAGE),
+    erlang:send_after(?TICK_TIMEOUT(State), self(), ?TICK_MESSAGE),
     State1 = lists:foldl(fun maybe_send_append/2, State, maps:keys(committed_members(State)) -- [State#state.me]),
     State2 =
         if
@@ -692,14 +714,14 @@ handle_info(?TICK_MESSAGE, State) when State#state.role =:= leader ->
                 % We may want to let follower to be able to send this message too
                 MergeLog = {merge, committed_members(State1), (State1#state.module):serialize(State1#state.custom_db)},
                 peer_send(Dest, #log_request{log = MergeLog}),
-                State1#state{merge_timeout_ms = now_ms() + ?MERGE_TIMEOUT_MS};
+                State1#state{merge_timeout_ms = ?MERGE_TIMEOUT(State1)};
             true ->
                 State1
         end,
     {noreply, maybe_reset(State2)};
 % non-leader tick
 handle_info(?TICK_MESSAGE, State) ->
-    erlang:send_after(?TICK_TIMEOUT_MS, self(), ?TICK_MESSAGE),
+    erlang:send_after(?TICK_TIMEOUT(State), self(), ?TICK_MESSAGE),
     State1 =
         case now_ms() > State#state.election_timeout_ms of
             true ->
@@ -875,7 +897,7 @@ maybe_send_append(Peer, State) ->
         NowMs > HeartbeatTimeoutMs ->
             send_empty_append(Peer, State),
             State#state{
-                peers = Peers#{Peer := PeerState#peer_state{heartbeat_timeout_ms = NowMs + ?HEARTBEAT_TIMEOUT_MS}}
+                peers = Peers#{Peer := PeerState#peer_state{heartbeat_timeout_ms = ?HEARTBEAT_TIMEOUT(State)}}
             };
         % We don't have the log peer need, send snapshot
         BaseIndex =:= 0; not is_map_key(BaseIndex, State#state.logs) ->
@@ -884,14 +906,14 @@ maybe_send_append(Peer, State) ->
                 peers = Peers#{
                     Peer := PeerState#peer_state{
                         base_index = State#state.append_index,
-                        heartbeat_timeout_ms = NowMs + ?HEARTBEAT_TIMEOUT_MS
+                        heartbeat_timeout_ms = ?HEARTBEAT_TIMEOUT(State)
                     }
                 }
             };
         % Regular batch send
         BaseIndex < State#state.append_index ->
             {LogTenureId, _LogRef, _Log} = map_get(BaseIndex, State#state.logs),
-            EndIndex = min(BaseIndex + ?BATCH_SIZE, State#state.append_index),
+            EndIndex = min(BaseIndex + ?BATCH_SIZE(State), State#state.append_index),
             peer_send(
                 Peer,
                 #append_request{
@@ -914,7 +936,7 @@ maybe_send_append(Peer, State) ->
                 peers = Peers#{
                     Peer => PeerState#peer_state{
                         base_index = EndIndex,
-                        heartbeat_timeout_ms = NowMs + ?HEARTBEAT_TIMEOUT_MS
+                        heartbeat_timeout_ms = ?HEARTBEAT_TIMEOUT(State)
                     }
                 }
             };
@@ -927,7 +949,7 @@ maybe_commit(State) when State#state.role =/= leader ->
     % This should never happen
     error("not leader");
 maybe_commit(State) when State#state.append_index =:= State#state.commit_index ->
-    State#state{reset_timeout_ms = now_ms() + ?RESET_TIMEOUT_MS};
+    State#state{reset_timeout_ms = ?RESET_TIMEOUT(State)};
 maybe_commit(State) ->
     NextIndex = State#state.commit_index + 1,
     {IsMerge, Members} =
@@ -958,18 +980,18 @@ maybe_commit(State) ->
             element(1, map_get(CommitIndex, State#state.logs)) =:= State#state.tenure_id
     of
         true when IsMerge ->
-            maybe_commit(commit(NextIndex, State#state{reset_timeout_ms = now_ms() + ?RESET_TIMEOUT_MS}));
+            maybe_commit(commit(NextIndex, State#state{reset_timeout_ms = ?RESET_TIMEOUT(State)}));
         true ->
             case gb_trees:larger(NextIndex, State#state.member_tree) of
                 {MemberChangeIndex, _} when MemberChangeIndex =< CommitIndex ->
                     maybe_commit(
                         commit(
                             MemberChangeIndex - 1,
-                            State#state{reset_timeout_ms = now_ms() + ?RESET_TIMEOUT_MS}
+                            State#state{reset_timeout_ms = ?RESET_TIMEOUT(State)}
                         )
                     );
                 _ ->
-                    commit(CommitIndex, State#state{reset_timeout_ms = now_ms() + ?RESET_TIMEOUT_MS})
+                    commit(CommitIndex, State#state{reset_timeout_ms = ?RESET_TIMEOUT(State)})
             end;
         _ ->
             State
@@ -1012,14 +1034,14 @@ maybe_cleanup(State) ->
 -spec initialize_election(#state{}) -> #state{}.
 initialize_election(State) when State#state.wait_snapshot ->
     % was just merged to another branch but not received data yet
-    State#state{election_timeout_ms = now_ms() + ?ELECTION_TIMEOUT_MS};
+    State#state{election_timeout_ms = ?ELECTION_TIMEOUT(State)};
 initialize_election(State) ->
     State1 = State#state{
         role = candidate,
         tenure_id = State#state.tenure_id + 1,
         leader = undefined,
         voted_for = State#state.me,
-        election_timeout_ms = now_ms() + ?ELECTION_TIMEOUT_MS,
+        election_timeout_ms = ?ELECTION_TIMEOUT(State),
         peers = #{Peer => #peer_state{} || Peer := _ <- State#state.peers}
     },
     lists:foldl(fun send_election/2, State1, maps:keys(State1#state.peers)).
@@ -1072,7 +1094,7 @@ to_follower(PeerBranch, PeerTenureId, State) ->
         % Leave it here for now
         wait_snapshot = State#state.wait_snapshot orelse (PeerBranch < State#state.branch),
         peer_monitors = #{},
-        election_timeout_ms = now_ms() + ?ELECTION_TIMEOUT_MS
+        election_timeout_ms = ?ELECTION_TIMEOUT(State)
     }.
 
 -spec maybe_leader_handover(#state{}) -> term().
@@ -1136,7 +1158,7 @@ reset(#state{me = {OldNs, Pid}} = State) ->
         peer_monitors = #{},
         election_timeout_ms = 0,
         merge_timeout_ms = 0,
-        reset_timeout_ms = now_ms() + ?RESET_TIMEOUT_MS,
+        reset_timeout_ms = ?RESET_TIMEOUT(State),
         custom_db = (State#state.module):reset(Me, State#state.custom_db),
         replies = #{}
     }.
@@ -1182,7 +1204,7 @@ append({LogId, {_TenureId, _LogRef, Log} = LogValue}, State) ->
                                 #{
                                     Peer => #peer_state{
                                         base_index = State#state.append_index,
-                                        heartbeat_timeout_ms = now_ms() + ?HEARTBEAT_TIMEOUT_MS,
+                                        heartbeat_timeout_ms = ?HEARTBEAT_TIMEOUT(State),
                                         monitor = map_get(Peer, Monitors)
                                     }
                                  || Peer := _ <- Members
@@ -1311,7 +1333,7 @@ cleanup(LogId, State) ->
     CleanupIndex = min(max(LogId, State#state.cleanup_index), State#state.commit_index),
     lists:foldl(
         fun(_LogId, StateAcc) ->
-            CleanupLogId = StateAcc#state.cleanup_index - maps:get(extra_logs, StateAcc#state.options, 1000),
+            CleanupLogId = StateAcc#state.cleanup_index - ?LOG_HISTORY_LEN(StateAcc),
             StateAcc#state{
                 logs = maps:remove(CleanupLogId, StateAcc#state.logs),
                 member_tree =
