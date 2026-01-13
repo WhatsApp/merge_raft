@@ -21,7 +21,8 @@ merge_raft behaviour
 -export([
     commit_async/2,
     commit_sync/2,
-    commit_sync/3
+    commit_sync_catched/3,
+    commit_sync_raw/3
 ]).
 
 %% Debug functions
@@ -74,7 +75,8 @@ merge_raft behaviour
 -type branch() :: peer().
 -type tenure_id() :: non_neg_integer().
 -type log_id() :: non_neg_integer().
--type log_ref() :: reference().
+% log_ref() need to be unique
+-type log_ref() :: reference() | gen_server:from().
 -type log_message() ::
     {custom, custom_log()}
     | {merge, members(), custom_db_serialized()}
@@ -91,8 +93,8 @@ merge_raft behaviour
 -define(REDIRECT, 1).
 -define(TICK_MESSAGE, tick).
 -define(HEARTBEAT_TIMEOUT(State), (now_ms() + map_get(heartbeat_timeout_ms, State#state.options))).
--define(ELECTION_TIMEOUT(State), (now_ms() + map_get(election_timeout_ms, State#state.options) +
-    rand:uniform(map_get(election_variance_ms, State#state.options)))).
+-define(ELECTION_VARIANCE(State), (now_ms() + rand:uniform(map_get(election_variance_ms, State#state.options)))).
+-define(ELECTION_TIMEOUT(State), (?ELECTION_VARIANCE(State) + map_get(election_timeout_ms, State#state.options))).
 -define(RESET_TIMEOUT(State), (now_ms() + map_get(reset_timeout_ms, State#state.options))).
 -define(TICK_TIMEOUT(State), map_get(tick_timeout_ms, State#state.options)).
 -define(MERGE_TIMEOUT(State), (now_ms() + map_get(merge_timeout_ms, State#state.options) +
@@ -160,7 +162,7 @@ merge_raft behaviour
 
 -record(log_request, {
     redirect = ?REDIRECT :: non_neg_integer(),
-    reply_to = make_ref() :: log_ref(),
+    log_ref = make_ref() :: log_ref(),
     log :: log_message()
 }).
 
@@ -176,7 +178,9 @@ merge_raft behaviour
     match_index = 0 :: log_id(),
     heartbeat_timeout_ms = 0 :: non_neg_integer(),
     voted = false :: boolean(),
-    monitor = undefined :: undefined | reference()
+    monitor = undefined :: undefined | reference(),
+    % not in original RAFT protocol
+    commit_index_sent = 0 :: log_id()
 }).
 
 -type member_tree() :: gb_trees:tree(log_id(), members()).
@@ -207,7 +211,7 @@ merge_raft behaviour
     merge_timeout_ms :: time_ms(),
     reset_timeout_ms :: time_ms(),
     custom_db :: custom_db(),
-    replies :: #{log_ref() => []}
+    replies :: #{gen_server:from() => []}
 }).
 
 -export_type([
@@ -283,26 +287,42 @@ start(Options) ->
 % API functions
 %==============================================================================
 
-% async commit can fail if Server dies or leader changed
+% commit_async can fail if Server dies or leader changed
 -spec commit_async(gen_server:server_ref(), custom_log()) -> ok.
 commit_async(Server, Log) ->
     gen_server:cast(Server, #log_request{log = {custom, Log}}).
 
-% if commit_sync returns error(), it will never got commit
-% if commit_sync crashes (timeout or server die), the request is possible to commit
+% If commit_sync returns an error(), the request may still eventually got committed in certain cases (timeout, reset).
+% If commit_sync returns ok, the request is guaranteed to be committed on Server even if it is a follower
 -spec commit_sync(gen_server:server_ref(), custom_log()) -> {ok, custom_result()} | error().
 commit_sync(Server, Log) ->
-    commit_sync(Server, Log, 5000).
+    commit_sync_catched(Server, Log, 5000).
 
--spec commit_sync(gen_server:server_ref(), custom_log(), timeout()) -> {ok, custom_result()} | error().
-commit_sync(Server, Log, Timeout) ->
-    gen_server:call(Server, #log_request{log = {custom, Log}}, Timeout).
+-spec commit_sync_catched(gen_server:server_ref(), custom_log(), timeout()) -> {ok, custom_result()} | error().
+commit_sync_catched(Server, Log, Timeout) ->
+    try
+        gen_server:call(Server, #log_request{log = {custom, Log}}, Timeout)
+    catch
+        exit:{Reason, _MFA} ->
+            {error, Reason};
+        Error:Reason:Stack ->
+            {error, {Error, Reason, Stack}}
+    end.
+
+-spec commit_sync_raw(gen_server:server_ref(), custom_log(), timeout()) -> custom_result().
+commit_sync_raw(Server, Log, Timeout) ->
+    case commit_sync_catched(Server, Log, Timeout) of
+        {ok, Result} ->
+            Result;
+        {error, Error} ->
+            error(Error)
+    end.
 
 %==============================================================================
 % Debug functions
 %==============================================================================
 
--spec connect(gen_server:server_ref(), [gen_server:server_ref()]) -> ok | not_supported.
+-spec connect(gen_server:server_ref(), [gen_server:server_ref()]) -> ok.
 connect(Server, Servers) ->
     gen_server:call(Server, {connect, Servers}).
 
@@ -368,28 +388,24 @@ init(#{module := Module} = Options) ->
         custom_db = CustomDb,
         replies = #{}
     },
-    State1 = discover(State#state{reset_timeout_ms = ?RESET_TIMEOUT(State)}),
+    send_discover(State),
     erlang:send_after(?TICK_TIMEOUT(State), self(), ?TICK_MESSAGE),
-    {ok, State1}.
+    {ok, State#state{reset_timeout_ms = ?RESET_TIMEOUT(State)}}.
 
-% erlint-ignore dialyzer_override
--dialyzer({nowarn_function, handle_call/3}).
 -spec handle_call
-    (#log_request{}, {pid(), [alias | reference()]}, #state{}) -> {noreply, #state{}};
-    ({connect, [gen_server:server_ref()]}, gen_server:from(), #state{}) -> {reply, ok | not_supported, #state{}};
+    (#log_request{}, gen_server:from(), #state{}) -> {noreply, #state{}};
+    ({connect, [gen_server:server_ref()]}, gen_server:from(), #state{}) -> {reply, ok, #state{}};
     (get_info, gen_server:from(), #state{}) -> {reply, map(), #state{}};
-    (dynamic(), gen_server:from(), #state{}) -> {reply, not_supported, #state{}}.
-handle_call(#log_request{} = LogRequest, {_Pid, [alias | Alias]}, State) ->
-    % eqwalizer:ignore bad multi-function support
-    handle_cast(LogRequest#log_request{reply_to = Alias}, State);
-handle_call({connect, Servers}, _From, #state{type = {dynamic, _}} = State) ->
-    % eqwalizer:ignore bad multi-function support
-    {reply, ok, discover(State#state{type = {dynamic, Servers}})};
+    % bad eqwalizer multi-function support, should be dynamic()
+    (dynamic, gen_server:from(), #state{}) -> {reply, not_supported, #state{}}.
+handle_call(#log_request{} = LogRequest, From, State) ->
+    handle_cast(LogRequest#log_request{log_ref = From}, State);
+handle_call({connect, Servers}, _From, State) ->
+    [send_discover(Server, State) || Server <- Servers],
+    {reply, ok, State};
 handle_call(get_info, _From, State) ->
-    % eqwalizer:ignore bad multi-function support
     {reply, get_info_impl(State), State};
 handle_call(_Request, _From, State) ->
-    % eqwalizer:ignore bad multi-function support
     {reply, not_supported, State}.
 
 -spec handle_cast(Request, #state{}) -> {noreply, #state{}} when
@@ -473,7 +489,6 @@ handle_cast(
                 Voted = length(Votes) + 1,
                 if
                     Voted >= Quorum ->
-                        [send_empty_append(Peer, State1) || Peer := _ <- Members, Peer =/= State1#state.me],
                         Monitors =
                             #{
                                 Peer => erlang:monitor(process, Pid, [{tag, follower_down}])
@@ -486,16 +501,15 @@ handle_cast(
                                 #{
                                     Peer => PeerState#peer_state{
                                         base_index = State1#state.append_index,
-                                        heartbeat_timeout_ms = ?HEARTBEAT_TIMEOUT(State1),
                                         monitor = map_get(Peer, Monitors)
                                     }
                                  || Peer := PeerState <- Peers1
                                 },
                             peer_monitors = #{Ref => Peer || Peer := Ref <- Monitors}
                         },
+                        send_discover(State2),
                         State3 = insert(make_ref(), {leader, State#state.me}, State2),
-                        % Questionable, maybe too expensive to do this on every leader change?
-                        discover(State3);
+                        lists:foldl(fun send_empty_append/2, State3, maps:keys(Members) -- [State3#state.me]);
                     true ->
                         State1
                 end;
@@ -632,7 +646,7 @@ handle_cast(
                             end
                     }
                 },
-                maybe_cleanup(maybe_commit(maybe_send_append(From, State1)));
+                maybe_send_append(From, maybe_cleanup(maybe_commit(State1)));
             PeerBranch < State#state.branch;
             (PeerBranch =:= State#state.branch andalso PeerTenureId > State#state.tenure_id) ->
                 to_follower(PeerBranch, PeerTenureId, State);
@@ -670,8 +684,8 @@ handle_cast(
                 State1
         end,
     {noreply, State2};
-handle_cast(#log_request{reply_to = Ref, log = Log}, State) when State#state.role =:= leader ->
-    State1 = maybe_single_member_commit(insert(Ref, Log, State#state{replies = (State#state.replies)#{Ref => []}})),
+handle_cast(#log_request{log_ref = Ref, log = Log} = LogRequest, State) when State#state.role =:= leader ->
+    State1 = maybe_single_member_commit(insert(Ref, Log, maybe_prepare_reply(LogRequest, State))),
     % Future: not always do a immediate send, batch a little bit
     State2 = lists:foldl(fun maybe_send_append/2, State1, maps:keys(committed_members(State1)) -- [State1#state.me]),
     {noreply, State2};
@@ -680,15 +694,15 @@ handle_cast(#log_request{redirect = Redirect} = LogRequest, State) when
     Redirect > 0
 ->
     peer_send(State#state.leader, LogRequest#log_request{redirect = Redirect - 1}),
-    {noreply, State};
-handle_cast(#log_request{reply_to = Ref}, State) when State#state.leader =:= undefined ->
+    {noreply, maybe_prepare_reply(LogRequest, State)};
+handle_cast(#log_request{log_ref = Ref}, State) when State#state.leader =:= undefined ->
     {noreply, reply(Ref, {error, no_leader}, State)};
-handle_cast(#log_request{reply_to = Ref}, State) when
+handle_cast(#log_request{log_ref = Ref}, State) when
     State#state.role =:= follower,
     map_size(State#state.peer_monitors) =:= 0
 ->
     {noreply, reply(Ref, {error, leader_down}, State)};
-handle_cast(#log_request{reply_to = Ref}, State) ->
+handle_cast(#log_request{log_ref = Ref}, State) ->
     {noreply, reply(Ref, {error, too_many_redirects}, State)};
 handle_cast(#discover{from = From, branch = PeerBranch, members = Members}, State) when
     State#state.role =:= leader andalso not is_map_key(From, State#state.peers) andalso
@@ -700,14 +714,14 @@ handle_cast(#discover{from = From, branch = PeerBranch, members = Members}, Stat
                 % Newer tree will pause itself and join to older tree
                 maybe_single_member_commit(insert(make_ref(), {pause, Members}, State));
             _ ->
-                discover(From, State)
+                send_discover(From, State),
+                State
         end,
     {noreply, State2};
 handle_cast(#discover{redirect = Redirect} = DiscoverRequest, State) when
     State#state.leader =/= undefined,
     Redirect > 0
 ->
-    % FIXME: discover when leader change happened, maybe send_after?
     peer_send(State#state.leader, DiscoverRequest#discover{redirect = Redirect - 1}),
     {noreply, State};
 handle_cast(_Request, State) ->
@@ -724,7 +738,7 @@ handle_cast(_Request, State) ->
 handle_info(?TICK_MESSAGE, State) when State#state.role =:= leader ->
     erlang:send_after(?TICK_TIMEOUT(State), self(), ?TICK_MESSAGE),
     State1 = lists:foldl(fun maybe_send_append/2, State, maps:keys(committed_members(State)) -- [State#state.me]),
-    {noreply, maybe_reset(maybe_send_merge(State1))};
+    {noreply, maybe_reset(maybe_send_merge(maybe_kick_reset_peers(State1)))};
 % non-leader tick
 handle_info(?TICK_MESSAGE, State) ->
     erlang:send_after(?TICK_TIMEOUT(State), self(), ?TICK_MESSAGE),
@@ -739,8 +753,8 @@ handle_info(?TICK_MESSAGE, State) ->
 handle_info({_NodeUpDown, Node}, State) when Node =:= node() ->
     {noreply, reset(State)};
 handle_info({nodeup, Node}, State) when State#state.role =:= leader ->
-    State1 = discover(Node, State),
-    {noreply, State1};
+    send_discover(Node, State),
+    {noreply, State};
 handle_info({follower_down, Ref, process, _Pid, _Reason}, State) when
     State#state.role =:= leader,
     is_map_key(Ref, State#state.peer_monitors)
@@ -757,7 +771,7 @@ handle_info({leader_down, Ref, process, _Pid, _Reason}, State) when
             true ->
                 initialize_election(State);
             _ ->
-                State
+                State#state{election_timeout_ms = ?ELECTION_VARIANCE(State)}
         end,
     {noreply, State1};
 handle_info({'EXIT', _, _}, State) ->
@@ -777,14 +791,14 @@ terminate(_Reason, State) ->
 %==============================================================================
 
 % Try to see if there is any other cluster that we can merge
--spec discover(#state{}) -> #state{}.
-discover(#state{type = {registered, _Name, _NodeFilterFun}} = State) ->
-    lists:foldl(fun discover/2, State, nodes());
-discover(#state{type = {dynamic, Peers}} = State) ->
-    lists:foldl(fun discover/2, State, Peers).
+-spec send_discover(#state{}) -> term().
+send_discover(#state{type = {registered, _Name, _NodeFilterFun}} = State) ->
+    [send_discover(Node, State) || Node <- nodes()];
+send_discover(#state{type = {dynamic, Peers}} = State) ->
+    [send_discover(Peer, State) || Peer <- Peers].
 
--spec discover(peer() | node() | gen_server:server_ref(), #state{}) -> #state{}.
-discover(Target, State) ->
+-spec send_discover(peer() | node() | gen_server:server_ref(), #state{}) -> term().
+send_discover(Target, State) ->
     gen_server:cast(
         case {Target, State#state.type} of
             {Node, {registered, Name, undefined}} when is_atom(Node) ->
@@ -806,42 +820,84 @@ discover(Target, State) ->
             branch = State#state.branch,
             members = committed_members(State)
         }
-    ),
-    State.
+    ).
 
--spec send_empty_append(peer(), #state{}) -> term().
-send_empty_append(Peer, State) ->
-    case (map_get(Peer, State#state.peers))#peer_state.base_index of
-        BaseIndex when BaseIndex =/= 0, is_map_key(BaseIndex, State#state.logs) ->
-            {BaseTanureId, _BaseLogRef, _BaseLog} = map_get(BaseIndex, State#state.logs),
-            peer_send(
-                Peer,
-                #append_request{
-                    from = State#state.me,
-                    to = Peer,
-                    branch = State#state.branch,
-                    tenure_id = State#state.tenure_id,
-                    prev_log_index = BaseIndex,
-                    prev_log_tenure = BaseTanureId,
-                    entries = [],
-                    leader_commit_index = State#state.commit_index,
-                    leader_cleanup_index = State#state.cleanup_index
-                }
-            );
-        _ ->
-            % Future: change this behavior to not double send snapshot in this case
-            send_snapshot(Peer, State)
+-spec maybe_kick_reset_peers(#state{}) -> #state{}.
+maybe_kick_reset_peers(State) ->
+    maps:fold(
+        fun
+            (_Pid, [_Peer], StateAcc) ->
+                StateAcc;
+            (_Pid, Peers, StateAcc) ->
+                lists:foldl(
+                    fun(Peer, StateAcc1) ->
+                        insert(make_ref(), {leave, Peer}, StateAcc1)
+                    end,
+                    StateAcc,
+                    lists:delete(lists:max(Peers), Peers)
+                )
+        end,
+        State,
+        maps:groups_from_list(fun({_, Pid}) -> Pid end, maps:keys(appended_members(State)))
+    ).
+
+-spec maybe_send_append(peer(), #state{}) -> #state{}.
+maybe_send_append(_Peer, State) when State#state.role =/= leader ->
+    % This should never happen
+    error("not leader");
+maybe_send_append(Peer, State) ->
+    NowMs = now_ms(),
+    #peer_state{
+        base_index = BaseIndex,
+        heartbeat_timeout_ms = HeartbeatTimeoutMs,
+        commit_index_sent = CommitIndexSent
+    } = map_get(Peer, State#state.peers),
+    % It is time to do heartbeat, or we have new data to send
+    if
+        NowMs > HeartbeatTimeoutMs ->
+            send_empty_append(Peer, State);
+        % We don't have the log peer need, send snapshot
+        not is_map_key(BaseIndex, State#state.logs) ->
+            send_snapshot(Peer, State);
+        % Regular batch send
+        BaseIndex < State#state.append_index; CommitIndexSent < State#state.commit_index ->
+            EndIndex = min(BaseIndex + ?BATCH_SIZE(State), State#state.append_index),
+            Entries =
+                [
+                    {LogIndex, maps:get(LogIndex, State#state.logs)}
+                 || LogIndex <- lists:seq(BaseIndex + 1, EndIndex)
+                ],
+            send_append(Peer, Entries, BaseIndex, EndIndex, State);
+        true ->
+            State
     end.
 
--spec send_snapshot(peer(), #state{}) -> term().
+-spec send_empty_append(peer(), #state{}) -> #state{}.
+send_empty_append(Peer, State) ->
+    BaseIndex = (map_get(Peer, State#state.peers))#peer_state.base_index,
+    send_append(Peer, [], BaseIndex, BaseIndex, State).
+
+-spec send_snapshot(peer(), #state{}) -> #state{}.
 send_snapshot(Peer, State) ->
-    {LogTenureId, LogRef, _Log} = map_get(State#state.append_index, State#state.logs),
+    {LogTenureId, LogRef, _Log} = map_get(State#state.commit_index, State#state.logs),
     Log = {
         snapshot,
         committed_members(State),
         State#state.paused,
         (State#state.module):serialize(State#state.custom_db)
     },
+    Entries = [{State#state.commit_index, {LogTenureId, LogRef, Log}}],
+    send_append(Peer, Entries, 0, State#state.commit_index, State).
+
+-spec send_append(peer(), [log_entry()], log_id(), log_id(), #state{}) -> #state{}.
+send_append(Peer, Entries, BaseIndex, EndIndex, State) ->
+    {PrevLogIndex, PrevLogTenure} =
+        case State#state.logs of
+            #{BaseIndex := {BaseTanureId, _BaseLogRef, _BaseLog}} ->
+                {BaseIndex, BaseTanureId};
+            _ ->
+                {0, 0}
+        end,
     peer_send(
         Peer,
         #append_request{
@@ -849,13 +905,23 @@ send_snapshot(Peer, State) ->
             to = Peer,
             branch = State#state.branch,
             tenure_id = State#state.tenure_id,
-            prev_log_index = 0,
-            prev_log_tenure = 0,
-            entries = [{State#state.append_index, {LogTenureId, LogRef, Log}}],
+            prev_log_index = PrevLogIndex,
+            prev_log_tenure = PrevLogTenure,
+            entries = Entries,
             leader_commit_index = State#state.commit_index,
             leader_cleanup_index = State#state.cleanup_index
         }
-    ).
+    ),
+    #{Peer := PeerState} = Peers = State#state.peers,
+    State#state{
+        peers = Peers#{
+            Peer := PeerState#peer_state{
+                base_index = EndIndex,
+                heartbeat_timeout_ms = ?HEARTBEAT_TIMEOUT(State),
+                commit_index_sent = State#state.commit_index
+            }
+        }
+    }.
 
 % Append an Log to the tree
 -spec insert(log_ref(), log_message(), #state{}) -> #state{}.
@@ -900,77 +966,23 @@ maybe_single_member_commit(State) ->
             State
     end.
 
--spec maybe_send_append(peer(), #state{}) -> #state{}.
-maybe_send_append(_Peer, State) when State#state.role =/= leader ->
-    % This should never happen
-    error("not leader");
-maybe_send_append(Peer, State) ->
-    NowMs = now_ms(),
-    #{
-        Peer := #peer_state{
-            base_index = BaseIndex,
-            heartbeat_timeout_ms = HeartbeatTimeoutMs
-        } = PeerState
-    } = Peers = State#state.peers,
-    % It is time to do heartbeat, or we have new data to send
-    if
-        NowMs > HeartbeatTimeoutMs ->
-            send_empty_append(Peer, State),
-            State#state{
-                peers = Peers#{Peer := PeerState#peer_state{heartbeat_timeout_ms = ?HEARTBEAT_TIMEOUT(State)}}
-            };
-        % We don't have the log peer need, send snapshot
-        BaseIndex =:= 0; not is_map_key(BaseIndex, State#state.logs) ->
-            send_snapshot(Peer, State),
-            State#state{
-                peers = Peers#{
-                    Peer := PeerState#peer_state{
-                        base_index = State#state.append_index,
-                        heartbeat_timeout_ms = ?HEARTBEAT_TIMEOUT(State)
-                    }
-                }
-            };
-        % Regular batch send
-        BaseIndex < State#state.append_index ->
-            {LogTenureId, _LogRef, _Log} = map_get(BaseIndex, State#state.logs),
-            EndIndex = min(BaseIndex + ?BATCH_SIZE(State), State#state.append_index),
-            peer_send(
-                Peer,
-                #append_request{
-                    from = State#state.me,
-                    to = Peer,
-                    branch = State#state.branch,
-                    tenure_id = State#state.tenure_id,
-                    prev_log_index = BaseIndex,
-                    prev_log_tenure = LogTenureId,
-                    entries =
-                        [
-                            {LogIndex, maps:get(LogIndex, State#state.logs)}
-                         || LogIndex <- lists:seq(BaseIndex + 1, EndIndex)
-                        ],
-                    leader_commit_index = State#state.commit_index,
-                    leader_cleanup_index = State#state.cleanup_index
-                }
-            ),
-            State#state{
-                peers = Peers#{
-                    Peer => PeerState#peer_state{
-                        base_index = EndIndex,
-                        heartbeat_timeout_ms = ?HEARTBEAT_TIMEOUT(State)
-                    }
-                }
-            };
+-spec maybe_commit(#state{}) -> #state{}.
+maybe_commit(State) ->
+    State1 = maybe_commit_impl(State),
+    case State1#state.commit_index > State#state.commit_index of
         true ->
-            State
+            lists:foldl(fun send_empty_append/2, State1, maps:keys(committed_members(State1)) -- [State1#state.me]);
+        _ ->
+            State1
     end.
 
--spec maybe_commit(#state{}) -> #state{}.
-maybe_commit(State) when State#state.role =/= leader ->
+-spec maybe_commit_impl(#state{}) -> #state{}.
+maybe_commit_impl(State) when State#state.role =/= leader ->
     % This should never happen
     error("not leader");
-maybe_commit(State) when State#state.append_index =:= State#state.commit_index ->
+maybe_commit_impl(State) when State#state.append_index =:= State#state.commit_index ->
     State#state{reset_timeout_ms = ?RESET_TIMEOUT(State)};
-maybe_commit(State) ->
+maybe_commit_impl(State) ->
     NextIndex = State#state.commit_index + 1,
     {IsMerge, Members} =
         case State#state.logs of
@@ -981,6 +993,7 @@ maybe_commit(State) ->
                 {false, get_members(NextIndex, State)}
         end,
     % Can improve performance here but probably an over kill
+    % Will be a performance issue in large cluster
     MatchList = lists:sort(
         [State#state.append_index] ++
             [
@@ -1000,11 +1013,11 @@ maybe_commit(State) ->
             element(1, map_get(CommitIndex, State#state.logs)) =:= State#state.tenure_id
     of
         true when IsMerge ->
-            maybe_commit(commit(NextIndex, State#state{reset_timeout_ms = ?RESET_TIMEOUT(State)}));
+            maybe_commit_impl(commit(NextIndex, State#state{reset_timeout_ms = ?RESET_TIMEOUT(State)}));
         true ->
             case gb_trees:larger(NextIndex, State#state.member_tree) of
                 {MemberChangeIndex, _} when MemberChangeIndex =< CommitIndex ->
-                    maybe_commit(
+                    maybe_commit_impl(
                         commit(
                             MemberChangeIndex - 1,
                             State#state{reset_timeout_ms = ?RESET_TIMEOUT(State)}
@@ -1090,12 +1103,17 @@ send_election(Peer, State) ->
 % common functions
 %==============================================================================
 
-% erlint-ignore dialyzer_override
--dialyzer({nowarn_function, reply/3}).
+-spec maybe_prepare_reply(#log_request{}, #state{}) -> #state{}.
+maybe_prepare_reply(#log_request{redirect = ?REDIRECT, log_ref = From}, State) when not is_reference(From) ->
+    State#state{replies = (State#state.replies)#{From => []}};
+maybe_prepare_reply(_LogRequest, State) ->
+    State.
+
 -spec reply(log_ref(), {ok, custom_result()} | error(), #state{}) -> #state{}.
-reply(LogRef, Message, State) when element(1, Message) =:= error; is_map_key(LogRef, State#state.replies) ->
-    % eqwalizer:ignore alias
-    LogRef ! {[alias | LogRef], Message},
+reply(LogRef, Message, State) when
+    not is_reference(LogRef) andalso (element(1, Message) =:= error orelse is_map_key(LogRef, State#state.replies))
+->
+    gen_server:reply(LogRef, Message),
     State#state{replies = maps:remove(LogRef, State#state.replies)};
 reply(_LogRef, _Message, State) ->
     State.
@@ -1156,7 +1174,7 @@ reset(#state{me = {OldNs, Pid}} = State) ->
         end,
     Me = {NowNs, Pid},
     [erlang:demonitor(Ref) || Ref := _ <- State#state.peer_monitors],
-    [Ref ! {error, reset} || Ref := _ <- State#state.replies],
+    [gen_server:reply(Ref, {error, reset}) || Ref := _ <- State#state.replies],
     #state{
         type = State#state.type,
         module = State#state.module,
