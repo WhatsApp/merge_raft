@@ -102,6 +102,7 @@ groups() ->
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(merge_raft_test),
     logger:set_module_level(merge_raft, debug),
+    logger:set_module_level(merge_raft_test, debug),
     Config.
 
 -spec end_per_suite(Config :: ct_suite:ct_config()) -> merge_raft_test:end_per_suite().

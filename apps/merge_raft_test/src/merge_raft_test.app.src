@@ -33,6 +33,7 @@
     {applications, [
         kernel,
         stdlib,
+        runtime_tools,
         common_test,
         proper,
         merge_raft
