@@ -181,8 +181,7 @@ leader_dies(_Config) ->
     exit(Pid1, kill),
     ok = receive {'DOWN', _Mon, process, Pid1, killed} -> ok end,
 
-    % Leader election happens after 5 seconds, maximum 6 seconds
-    timer:sleep(6_000),
+    ct:log("~w", [mr_cb_test:sync(Pids -- [Pid1])]),
 
     {ok, ok} = mr_cb_test:put(Pid3, c, 3),
     ct:log("~w", [mr_cb_test:sync(Pids -- [Pid1])]),
@@ -194,7 +193,7 @@ leader_dies(_Config) ->
 updates_while_leader_dies(_Config) ->
     {Pids, Mons} = mr_cb_test:init_cluster(),
 
-    % Test case too be added
+    % Test case to be added
 
     mr_cb_test:cleanup({Pids, Mons}).
 

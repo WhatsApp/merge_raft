@@ -54,10 +54,11 @@ merge_raft behaviour
     target_cluster_size => pos_integer(),
     tick_timeout_ms => pos_integer(),
     heartbeat_timeout_ms => pos_integer(),
-    election_variance_ms => pos_integer(),
     election_timeout_ms => pos_integer(),
+    election_variance_ms => pos_integer(),
     reset_timeout_ms => pos_integer(),
     merge_timeout_ms => pos_integer(),
+    merge_variance_ms => pos_integer(),
     batch_size => pos_integer(),
     log_history_len => non_neg_integer()
 }.
@@ -94,7 +95,8 @@ merge_raft behaviour
     rand:uniform(map_get(election_variance_ms, State#state.options)))).
 -define(RESET_TIMEOUT(State), (now_ms() + map_get(reset_timeout_ms, State#state.options))).
 -define(TICK_TIMEOUT(State), map_get(tick_timeout_ms, State#state.options)).
--define(MERGE_TIMEOUT(State), (now_ms() + map_get(merge_timeout_ms, State#state.options))).
+-define(MERGE_TIMEOUT(State), (now_ms() + map_get(merge_timeout_ms, State#state.options) +
+    rand:uniform(map_get(merge_variance_ms, State#state.options)))).
 -define(BATCH_SIZE(State), map_get(batch_size, State#state.options)).
 -define(LOG_HISTORY_LEN(State), map_get(log_history_len, State#state.options)).
 
@@ -281,10 +283,13 @@ start(Options) ->
 % API functions
 %==============================================================================
 
+% async commit can fail if Server dies or leader changed
 -spec commit_async(gen_server:server_ref(), custom_log()) -> ok.
 commit_async(Server, Log) ->
     gen_server:cast(Server, #log_request{log = {custom, Log}}).
 
+% if commit_sync returns error(), it will never got commit
+% if commit_sync crashes (timeout or server die), the request is possible to commit
 -spec commit_sync(gen_server:server_ref(), custom_log()) -> {ok, custom_result()} | error().
 commit_sync(Server, Log) ->
     commit_sync(Server, Log, 5000).
@@ -318,10 +323,11 @@ init(#{module := Module} = Options) ->
         #{
             heartbeat_timeout_ms => 20 * TargetClusterSize,
             tick_timeout_ms => 25 * TargetClusterSize,
-            election_variance_ms => 100 * TargetClusterSize,
             election_timeout_ms => 5000,
+            election_variance_ms => 100 * TargetClusterSize,
             reset_timeout_ms => 300_000,
-            merge_timeout_ms => 200 * TargetClusterSize,
+            merge_timeout_ms => 1000,
+            merge_variance_ms => 200 * TargetClusterSize,
             batch_size => 100,
             log_history_len => 1000
         },
@@ -470,7 +476,7 @@ handle_cast(
                         [send_empty_append(Peer, State1) || Peer := _ <- Members, Peer =/= State1#state.me],
                         Monitors =
                             #{
-                                Peer => erlang:monitor(process, Pid, [{tag, peer_down}])
+                                Peer => erlang:monitor(process, Pid, [{tag, follower_down}])
                              || {_, Pid} = Peer := _PeerState <- Peers1
                             },
                         State2 = State1#state{
@@ -502,7 +508,7 @@ handle_cast(
     {noreply, State4};
 handle_cast(
     #append_request{
-        from = From,
+        from = {_, Pid} = From,
         to = To,
         branch = PeerBranch,
         tenure_id = PeerTenureId,
@@ -518,7 +524,11 @@ handle_cast(
         if
             PeerBranch < State#state.branch;
             (PeerBranch =:= State#state.branch andalso PeerTenureId > State#state.tenure_id) ->
-                (to_follower(PeerBranch, PeerTenureId, State))#state{leader = From, voted_for = From};
+                (to_follower(PeerBranch, PeerTenureId, State))#state{
+                    leader = From,
+                    voted_for = From,
+                    peer_monitors = #{erlang:monitor(process, Pid, [{tag, leader_down}]) => From}
+                };
             PeerBranch =:= State#state.branch andalso PeerTenureId =:= State#state.tenure_id ->
                 % This should never happen
                 State#state.leader =/= undefined andalso State#state.leader =/= From andalso error("wrong leader"),
@@ -531,6 +541,13 @@ handle_cast(
                                 From;
                             _ ->
                                 State#state.voted_for
+                        end,
+                    peer_monitors =
+                        case State#state.leader of
+                            From ->
+                                State#state.peer_monitors;
+                            _ ->
+                                #{erlang:monitor(process, Pid, [{tag, leader_down}]) => From}
                         end,
                     election_timeout_ms = ?ELECTION_TIMEOUT(State),
                     reset_timeout_ms = ?RESET_TIMEOUT(State)
@@ -653,9 +670,7 @@ handle_cast(
                 State1
         end,
     {noreply, State2};
-handle_cast(#log_request{reply_to = Ref, log = Log}, State) when
-    State#state.role =:= leader
-->
+handle_cast(#log_request{reply_to = Ref, log = Log}, State) when State#state.role =:= leader ->
     State1 = maybe_single_member_commit(insert(Ref, Log, State#state{replies = (State#state.replies)#{Ref => []}})),
     % Future: not always do a immediate send, batch a little bit
     State2 = lists:foldl(fun maybe_send_append/2, State1, maps:keys(committed_members(State1)) -- [State1#state.me]),
@@ -666,6 +681,15 @@ handle_cast(#log_request{redirect = Redirect} = LogRequest, State) when
 ->
     peer_send(State#state.leader, LogRequest#log_request{redirect = Redirect - 1}),
     {noreply, State};
+handle_cast(#log_request{reply_to = Ref}, State) when State#state.leader =:= undefined ->
+    {noreply, reply(Ref, {error, no_leader}, State)};
+handle_cast(#log_request{reply_to = Ref}, State) when
+    State#state.role =:= follower,
+    map_size(State#state.peer_monitors) =:= 0
+->
+    {noreply, reply(Ref, {error, leader_down}, State)};
+handle_cast(#log_request{reply_to = Ref}, State) ->
+    {noreply, reply(Ref, {error, too_many_redirects}, State)};
 handle_cast(#discover{from = From, branch = PeerBranch, members = Members}, State) when
     State#state.role =:= leader andalso not is_map_key(From, State#state.peers) andalso
         map_size(State#state.paused) =:= 0 andalso PeerBranch =/= State#state.branch
@@ -683,6 +707,7 @@ handle_cast(#discover{redirect = Redirect} = DiscoverRequest, State) when
     State#state.leader =/= undefined,
     Redirect > 0
 ->
+    % FIXME: discover when leader change happened, maybe send_after?
     peer_send(State#state.leader, DiscoverRequest#discover{redirect = Redirect - 1}),
     {noreply, State};
 handle_cast(_Request, State) ->
@@ -693,32 +718,13 @@ handle_cast(_Request, State) ->
     TickMsg :: ?TICK_MESSAGE,
     Nodeup :: {nodeup, Node :: node()},
     Nodedown :: {nodedown, Node :: node()},
-    PeerDown :: {peer_down, MonitorRef :: reference(), process, Pid :: pid(), Reason :: term()},
+    PeerDown :: {follower_down | leader_down, MonitorRef :: reference(), process, Pid :: pid(), Reason :: term()},
     ExitMsg :: {'EXIT', Pid :: pid(), Reason :: term()}.
 % leader tick
 handle_info(?TICK_MESSAGE, State) when State#state.role =:= leader ->
-    NowMs = now_ms(),
     erlang:send_after(?TICK_TIMEOUT(State), self(), ?TICK_MESSAGE),
     State1 = lists:foldl(fun maybe_send_append/2, State, maps:keys(committed_members(State)) -- [State#state.me]),
-    State2 =
-        if
-            map_size(State1#state.paused) =:= 0 ->
-                % Check below quorum here
-                State1;
-            map_size(State1#state.paused) > 0,
-            NowMs > State1#state.merge_timeout_ms,
-            % not State#state.wait_snapshot,
-            State1#state.append_index =:= State1#state.apply_index ->
-                Destinations = maps:keys(State1#state.paused),
-                Dest = lists:nth(rand:uniform(length(Destinations)), Destinations),
-                % We may want to let follower to be able to send this message too
-                MergeLog = {merge, committed_members(State1), (State1#state.module):serialize(State1#state.custom_db)},
-                peer_send(Dest, #log_request{log = MergeLog}),
-                State1#state{merge_timeout_ms = ?MERGE_TIMEOUT(State1)};
-            true ->
-                State1
-        end,
-    {noreply, maybe_reset(State2)};
+    {noreply, maybe_reset(maybe_send_merge(State1))};
 % non-leader tick
 handle_info(?TICK_MESSAGE, State) ->
     erlang:send_after(?TICK_TIMEOUT(State), self(), ?TICK_MESSAGE),
@@ -729,17 +735,31 @@ handle_info(?TICK_MESSAGE, State) ->
             false ->
                 State
         end,
-    {noreply, maybe_reset(State1)};
+    {noreply, maybe_reset(maybe_send_merge(State1))};
 handle_info({_NodeUpDown, Node}, State) when Node =:= node() ->
     {noreply, reset(State)};
 handle_info({nodeup, Node}, State) when State#state.role =:= leader ->
     State1 = discover(Node, State),
     {noreply, State1};
-handle_info({peer_down, Ref, process, _Pid, _Reason}, State) when
+handle_info({follower_down, Ref, process, _Pid, _Reason}, State) when
     State#state.role =:= leader,
     is_map_key(Ref, State#state.peer_monitors)
 ->
     {noreply, insert(make_ref(), {leave, map_get(Ref, State#state.peer_monitors)}, State)};
+handle_info({leader_down, Ref, process, _Pid, _Reason}, State) when
+    State#state.role =:= follower,
+    is_map_key(Ref, State#state.peer_monitors)
+->
+    State1 =
+        % Choose the oldest peer as the new leader
+        % This only works well when there is no pending commits
+        case State#state.me =:= hd(lists:sort(maps:keys(appended_members(State)) -- [State#state.leader])) of
+            true ->
+                initialize_election(State);
+            _ ->
+                State
+        end,
+    {noreply, State1};
 handle_info({'EXIT', _, _}, State) ->
     {stop, exit, State};
 handle_info(_Info, State) ->
@@ -1036,6 +1056,7 @@ initialize_election(State) when State#state.wait_snapshot ->
     % was just merged to another branch but not received data yet
     State#state{election_timeout_ms = ?ELECTION_TIMEOUT(State)};
 initialize_election(State) ->
+    [erlang:demonitor(Ref) || Ref := _ <- State#state.peer_monitors],
     State1 = State#state{
         role = candidate,
         tenure_id = State#state.tenure_id + 1,
@@ -1172,6 +1193,24 @@ maybe_reset(State) ->
             State
     end.
 
+-spec maybe_send_merge(#state{}) -> #state{}.
+maybe_send_merge(State) when map_size(State#state.paused) =:= 0 ->
+    State;
+maybe_send_merge(State) ->
+    case now_ms() > State#state.merge_timeout_ms of
+        % In current logic, if leader died before pause is committed,
+        % then the current branch cannot be successfully merged to another branch anymore
+        % Only way to recover is wait for reset
+        true when not State#state.wait_snapshot, State#state.append_index =:= State#state.apply_index ->
+            Destinations = maps:keys(State#state.paused),
+            Dest = lists:nth(rand:uniform(length(Destinations)), Destinations),
+            MergeLog = {merge, committed_members(State), (State#state.module):serialize(State#state.custom_db)},
+            peer_send(Dest, #log_request{log = MergeLog}),
+            State#state{merge_timeout_ms = ?MERGE_TIMEOUT(State)};
+        _ ->
+            State
+    end.
+
 -spec append(log_entry() | [log_entry()], #state{}) -> #state{}.
 append([], State) ->
     State;
@@ -1194,7 +1233,7 @@ append({LogId, {_TenureId, _LogRef, Log} = LogValue}, State) ->
                     leader ->
                         Monitors =
                             #{
-                                Peer => erlang:monitor(process, Pid, [{tag, peer_down}])
+                                Peer => erlang:monitor(process, Pid, [{tag, follower_down}])
                              || {_, Pid} = Peer := _ <- Members
                             },
                         State#state{
@@ -1322,7 +1361,16 @@ apply_one(_LogId, State) ->
         {_TenureId, _LogRef, {leader, _Peer}} ->
             State#state{apply_index = State#state.apply_index + 1};
         {_TenureId, _LogRef, {pause, _Paused}} ->
-            State#state{apply_index = State#state.apply_index + 1};
+            maybe_send_merge(State#state{
+                apply_index = State#state.apply_index + 1,
+                merge_timeout_ms =
+                    case State#state.role of
+                        leader ->
+                            0;
+                        _ ->
+                            ?MERGE_TIMEOUT(State)
+                    end
+            });
         {_TenureId, _LogRef, {snapshot, _Members, _Paused, _CustomDbSerialized}} ->
             % This should never happen
             error("wrong apply")
