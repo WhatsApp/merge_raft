@@ -352,16 +352,16 @@ init(#{module := Module} = Options) ->
             log_history_len => 1000
         },
     Me = {now_ns(), self()},
-    {undefined, CustomDb} =
-        case Type of
-            {registered, Name, _Fun} ->
-                net_kernel:monitor_nodes(true),
-                process_flag(async_dist, true),
-                % Future: implement read from backup
-                Module:db_init(Me, Name);
-            {dynamic, _Peers} ->
-                Module:db_init(Me, undefined)
-        end,
+    case Type of
+        {registered, _Name, _Fun} ->
+            net_kernel:monitor_nodes(true),
+            process_flag(async_dist, true);
+        _ ->
+            ok
+    end,
+    %% Future: implement read from backup
+    {undefined, CustomDb} = Module:db_init(Me, maps:get(cb_state, Options, undefined)),
+
     State = #state{
         type = Type,
         module = Module,

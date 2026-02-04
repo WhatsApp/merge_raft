@@ -114,7 +114,8 @@ reset({_, Pid} = _Me, _Db) ->
 init([]) ->
     net_kernel:monitor_nodes(true),
     process_flag(async_dist, true),
-    merge_raft:start_link(#{type => {registered, ?RAFT_SERVER, undefined}, module => ?MODULE}),
+    merge_raft:start_link(#{type => {registered, ?RAFT_SERVER, undefined}, module => ?MODULE,
+                            cb_state => #{companion => self(), name => ?RAFT_SERVER}}),
     {ok, #{Node => up || Node <- nodes()}}.
 
 -spec handle_call(dynamic(), gen_server:from(), state()) -> no_return().
